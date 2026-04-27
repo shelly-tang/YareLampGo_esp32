@@ -1207,7 +1207,7 @@ static esp_err_t index_handler(httpd_req_t *req)
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 26;
 
     httpd_uri_t index_uri = {
         .uri = "/",
@@ -1383,6 +1383,11 @@ void startCameraServer()
     {
         httpd_register_uri_handler(stream_httpd, &stream_uri);
     }
+}
+
+httpd_handle_t getCameraHttpd()
+{
+    return camera_httpd;
 }
 
 void setupLedFlash(int pin) 

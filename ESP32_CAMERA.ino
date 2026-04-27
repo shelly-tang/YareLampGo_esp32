@@ -3,16 +3,11 @@
 #include "FS.h"
 #include "SD.h"
 #include "SPI.h"
-#include "avi_recorder.h"
 
-//
-// WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
-//            Ensure ESP32 Wrover Module or other board with PSRAM is selected
-//            Partial images will be transmitted if image exceeds buffer size
-//
-//            You must select partition scheme from the board menu that has at least 3MB APP space.
-//            Face Recognition is DISABLED for ESP32 and ESP32-S2, because it takes up from 15
-//            seconds to process single frame. Face Detection is ENABLED if PSRAM is enabled as well
+#include "avi_recorder.h"
+#include "net_config.h"
+#include "provision_ap.h"
+#include "work_mode.h"
 
 // ===================
 // Select camera model
@@ -20,29 +15,12 @@
 #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
 #include "camera_pins.h"
 
-// ===========================
-// Enter your WiFi credentials
-// ===========================
-const char *ssid = "YOUR_WIFI_SSID";
-const char *password = "YOUR_WIFI_PASSWORD";
-
 void startCameraServer();
 void setupLedFlash(int pin);
 
-void setup() {
-  Serial.begin(115200);
-  Serial.setDebugOutput(true);
-  Serial.println();
+static bool g_sdReady = false;
 
-  Serial.printf("PSRAM found: %s\n", psramFound() ? "YES" : "NO");
-  Serial.printf("PSRAM size : %u bytes\n", (unsigned)ESP.getPsramSize());
-  Serial.printf("Free PSRAM : %u bytes\n", (unsigned)ESP.getFreePsram());
-#ifdef BOARD_HAS_PSRAM
-  Serial.println("BOARD_HAS_PSRAM is DEFINED -> face detect compiled IN");
-#else
-  Serial.println("BOARD_HAS_PSRAM NOT defined -> face detect compiled OUT!");
-#endif
-
+static bool initCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -64,101 +42,113 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.frame_size = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG; // for streaming
-  //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
   config.jpeg_quality = 12;
   config.fb_count = 1;
 
-  // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
-  //                      for larger pre-allocated frame buffer.
   if (config.pixel_format == PIXFORMAT_JPEG) {
     if (psramFound()) {
       config.jpeg_quality = 10;
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {
-      // Limit the frame size when PSRAM is not available
       config.frame_size = FRAMESIZE_SVGA;
       config.fb_location = CAMERA_FB_IN_DRAM;
     }
   } else {
-    // Best option for face detection/recognition
     config.frame_size = FRAMESIZE_240X240;
 #if CONFIG_IDF_TARGET_ESP32S3
     config.fb_count = 2;
 #endif
   }
 
-#if defined(CAMERA_MODEL_ESP_EYE)
-  pinMode(13, INPUT_PULLUP);
-  pinMode(14, INPUT_PULLUP);
-#endif
-
-  // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
   }
 
   sensor_t *s = esp_camera_sensor_get();
-  // initial sensors are flipped vertically and colors are a bit saturated
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1); // flip it back
-    s->set_brightness(s, 1); // up the brightness just a bit
-    s->set_saturation(s, -2); // lower the saturation
+  if (s != nullptr) {
+    if (s->id.PID == OV3660_PID) {
+      s->set_vflip(s, 1);
+      s->set_brightness(s, 1);
+      s->set_saturation(s, -2);
+    }
+    if (config.pixel_format == PIXFORMAT_JPEG) {
+      s->set_framesize(s, FRAMESIZE_SVGA);
+    }
   }
-  // drop down frame size for higher initial frame rate
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_SVGA);
-  }
 
-#if defined(CAMERA_MODEL_M5STACK_WIDE) || defined(CAMERA_MODEL_M5STACK_ESP32CAM)
-  s->set_vflip(s, 1);
-  s->set_hmirror(s, 1);
-#endif
-
-#if defined(CAMERA_MODEL_ESP32S3_EYE)
-  s->set_vflip(s, 1);
-#endif
-
-// Setup LED FLash if LED pin is defined in camera_pins.h
 #if defined(LED_GPIO_NUM)
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
-  // Initialize SD card (GPIO 21 = CS on XIAO ESP32S3 Sense)
-  bool sdReady = SD.begin(21);
-  if (sdReady) {
+  return true;
+}
+
+static void initSd() {
+  g_sdReady = SD.begin(21);
+  if (g_sdReady) {
     Serial.println("SD Card Mounted.");
   } else {
     Serial.println("SD Card Mount Failed! Recording disabled.");
   }
+}
 
-  WiFi.begin(ssid, password);
-  WiFi.setSleep(false);
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+  Serial.printf("PSRAM found: %s\n", psramFound() ? "YES" : "NO");
+  Serial.printf("PSRAM size : %u bytes\n", (unsigned)ESP.getPsramSize());
+  Serial.printf("Free PSRAM : %u bytes\n", (unsigned)ESP.getFreePsram());
+#ifdef BOARD_HAS_PSRAM
+  Serial.println("BOARD_HAS_PSRAM is DEFINED -> face detect compiled IN");
+#else
+  Serial.println("BOARD_HAS_PSRAM NOT defined -> face detect compiled OUT!");
+#endif
+
+  NetConfig::begin();
+  Serial.printf("Device suffix: %s, hostname: %s.local\n",
+                NetConfig::deviceIdSuffix().c_str(),
+                NetConfig::deviceHostname().c_str());
+
+  if (!initCamera()) {
+    Serial.println("FATAL: camera init failed, halting.");
+    while (true) {
+      delay(1000);
+    }
   }
-  Serial.println("");
-  Serial.println("WiFi connected");
+  initSd();
 
-  startCameraServer();
+  if (!NetConfig::hasCredentials()) {
+    Serial.println("No WiFi credentials stored. Entering provisioning mode.");
+    ProvisionAP::start();
+    return;
+  }
 
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
+  if (!WorkMode::start()) {
+    Serial.println("WiFi connect failed. Clearing credentials and entering provisioning mode.");
+    NetConfig::clearWifi();
+    ProvisionAP::start();
+    return;
+  }
 
-  if (sdReady) {
+  if (g_sdReady) {
     startRecording();
   }
 }
 
 void loop() {
-  // Do nothing. Everything is done in another task by the web server
-  delay(10000);
+  if (ProvisionAP::isActive()) {
+    ProvisionAP::loop();
+  } else if (WorkMode::isActive()) {
+    WorkMode::loop();
+  } else {
+    delay(1000);
+  }
 }

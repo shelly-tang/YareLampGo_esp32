@@ -4,6 +4,7 @@
 #include "esp_camera.h"
 #include "FS.h"
 #include "SD.h"
+#include "net_config.h"
 
 // ============================
 // Recording configuration
@@ -218,20 +219,46 @@ static void _aviClose(uint16_t w, uint16_t h) {
                 _aviFrameCnt, fps, totalSize / 1024.0);
 }
 
+// Long-press threshold for WiFi reset (milliseconds)
+#define BOOT_LONG_PRESS_MS  10000
+
+// Check if BOOT button is held down for ≥ BOOT_LONG_PRESS_MS.
+// Returns true if a WiFi reset was triggered (device will restart).
+static bool _checkLongPress() {
+  if (digitalRead(REC_BTN_PIN) != LOW) return false;
+  unsigned long holdStart = millis();
+  while (digitalRead(REC_BTN_PIN) == LOW) {
+    unsigned long held = millis() - holdStart;
+    if (held >= BOOT_LONG_PRESS_MS) {
+      Serial.println("\n[button] BOOT held >=10s — clearing WiFi, restarting into SoftAP…");
+      NetConfig::clearWifi();
+      delay(200);
+      ESP.restart();
+      return true;  // unreachable, but for clarity
+    }
+    if (held >= 3000 && held % 1000 < 100) {
+      Serial.printf("[button] keep holding… %lus / 10s\n", held / 1000);
+    }
+    vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  return false;
+}
+
 // FreeRTOS task: button-controlled AVI recording
-//   BOOT button press  -> start recording
-//   BOOT button press  -> stop & save
+//   short press BOOT   -> start/stop recording
+//   long press  BOOT (≥10s) -> clear WiFi, reboot into SoftAP
 //   auto-stops at AVI_RECORD_SECS or AVI_MAX_FRAMES
 static void _recordingTask(void* param) {
   pinMode(REC_BTN_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(REC_BTN_PIN), _btnISR, FALLING);
 
-  Serial.println("Ready. Press BOOT button to start recording.");
+  Serial.println("Ready. Press BOOT to record; hold 10s to reset WiFi.");
 
   for (;;) {
     // ---- idle: wait for button press to start ----
     while (!_btnPressed) { vTaskDelay(pdMS_TO_TICKS(50)); }
     _btnPressed = false;
+    if (_checkLongPress()) continue;
 
     char fname[32];
     sprintf(fname, "/vid%04d.avi", _aviFileIdx);
@@ -263,11 +290,14 @@ static void _recordingTask(void* param) {
       esp_camera_fb_return(fb);
     }
 
+    bool wasLongPress = _btnPressed && _checkLongPress();
     _btnPressed = false;
+    if (wasLongPress) continue;
+
     _aviClose(fw, fh);
     _aviFileIdx++;
 
-    Serial.println(">> REC STOP. Press BOOT button to start new recording.");
+    Serial.println(">> REC STOP. Press BOOT to record; hold 10s to reset WiFi.");
     vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
