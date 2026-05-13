@@ -3,10 +3,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <cJSON.h>
+#include <esp_heap_caps.h>
 #include <esp_camera.h>
 
 #include "mic_stream.h"
 #include "net_config.h"
+#include "speaker_stream.h"
 
 namespace {
 
@@ -49,7 +51,25 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
   cJSON_AddNumberToObject(root, "uptime_ms", (double)millis());
   cJSON_AddNumberToObject(root, "free_heap", (double)ESP.getFreeHeap());
   cJSON_AddNumberToObject(root, "free_psram", (double)ESP.getFreePsram());
+  cJSON_AddNumberToObject(root, "internal_free_heap",
+                          (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(root, "internal_min_free_heap",
+                          (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(root, "internal_largest_free_block",
+                          (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(root, "psram_free_heap",
+                          (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(root, "psram_min_free_heap",
+                          (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(root, "psram_largest_free_block",
+                          (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   cJSON_AddBoolToObject(root, "mic_streaming", MicStream::isRunning());
+  cJSON_AddBoolToObject(root, "mic_aec_ready", MicStream::isAecReady());
+  cJSON_AddNumberToObject(root, "mic_ws_clients", MicStream::clientCount());
+  cJSON_AddNumberToObject(root, "mic_bytes_read", (double)MicStream::bytesRead());
+  cJSON_AddNumberToObject(root, "mic_frames_sent", (double)MicStream::framesSent());
+  cJSON_AddBoolToObject(root, "speaker_streaming", SpeakerStream::isRunning());
+  cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
 
   if (sensor != nullptr) {
     cJSON_AddNumberToObject(root, "framesize", sensor->status.framesize);
@@ -150,6 +170,15 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
   item = cJSON_GetObjectItemCaseSensitive(doc, "vflip");
   if (cJSON_IsBool(item)) {
     sensor->set_vflip(sensor, cJSON_IsTrue(item) ? 1 : 0);
+    applied++;
+  }
+
+  item = cJSON_GetObjectItemCaseSensitive(doc, "speaker_volume");
+  if (cJSON_IsNumber(item)) {
+    double v = item->valuedouble;
+    if (v < 0.0) v = 0.0;
+    if (v > 1.0) v = 1.0;
+    SpeakerStream::setVolume((float)v);
     applied++;
   }
 

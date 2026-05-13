@@ -4,6 +4,8 @@
 namespace WorkMode {
 
 bool start();
+bool connectNetwork();
+bool startServices();
 
 void loop();
 

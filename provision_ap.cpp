@@ -126,9 +126,23 @@ void start() {
   g_active = true;
 
   WiFi.persistent(false);
-  WiFi.mode(WIFI_AP_STA);
+  WiFi.disconnect(false, true);
+  delay(200);
+  WiFi.mode(WIFI_OFF);
+  delay(500);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
   const String ssid = NetConfig::apSsid();
   bool ok = WiFi.softAP(ssid.c_str(), NetConfig::apPassword());
+  if (!ok) {
+    Serial.println("[provision] softAP first attempt failed, retrying");
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(800);
+    WiFi.mode(WIFI_AP);
+    delay(200);
+    ok = WiFi.softAP(ssid.c_str(), NetConfig::apPassword());
+  }
   IPAddress ip = WiFi.softAPIP();
 
   Serial.println();

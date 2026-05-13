@@ -54,7 +54,9 @@ static bool initCamera() {
       config.fb_count = 2;
       config.grab_mode = CAMERA_GRAB_LATEST;
     } else {
-      config.frame_size = FRAMESIZE_SVGA;
+      config.frame_size = FRAMESIZE_QVGA;
+      config.jpeg_quality = 18;
+      config.fb_count = 1;
       config.fb_location = CAMERA_FB_IN_DRAM;
     }
   } else {
@@ -78,7 +80,7 @@ static bool initCamera() {
       s->set_saturation(s, -2);
     }
     if (config.pixel_format == PIXFORMAT_JPEG) {
-      s->set_framesize(s, FRAMESIZE_SVGA);
+      s->set_framesize(s, psramFound() ? FRAMESIZE_SVGA : FRAMESIZE_QVGA);
     }
   }
 
@@ -117,25 +119,30 @@ void setup() {
                 NetConfig::deviceIdSuffix().c_str(),
                 NetConfig::deviceHostname().c_str());
 
-  if (!initCamera()) {
-    Serial.println("FATAL: camera init failed, halting.");
-    while (true) {
-      delay(1000);
-    }
-  }
-  initSd();
-
   if (!NetConfig::hasCredentials()) {
     Serial.println("No WiFi credentials stored. Entering provisioning mode.");
     ProvisionAP::start();
     return;
   }
 
-  if (!WorkMode::start()) {
+  if (!WorkMode::connectNetwork()) {
     Serial.println("WiFi connect failed. Clearing credentials and entering provisioning mode.");
     NetConfig::clearWifi();
     ProvisionAP::start();
     return;
+  }
+
+  bool cameraReady = initCamera();
+  if (!cameraReady) {
+    Serial.println("Camera init failed; continuing with mic/speaker only.");
+  }
+  initSd();
+
+  if (!WorkMode::startServices()) {
+    Serial.println("Work services failed. Halting.");
+    while (true) {
+      delay(1000);
+    }
   }
 
   if (g_sdReady) {

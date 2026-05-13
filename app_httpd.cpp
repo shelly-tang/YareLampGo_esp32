@@ -24,20 +24,10 @@
 #include "esp32-hal-log.h"
 #endif
 
-// Face Detection will not work on boards without (or with disabled) PSRAM
-#ifdef BOARD_HAS_PSRAM
-#define CONFIG_ESP_FACE_DETECT_ENABLED 1
-// Face Recognition takes upward from 15 seconds per frame on chips other than ESP32S3
-// Makes no sense to have it enabled for them
-#if CONFIG_IDF_TARGET_ESP32S3
-#define CONFIG_ESP_FACE_RECOGNITION_ENABLED 1
-#else
-#define CONFIG_ESP_FACE_RECOGNITION_ENABLED 0
-#endif
-#else
+// Face detection/recognition disabled: new esp32-arduino cores no longer ship
+// human_face_detect_*.hpp, and this project doesn't need it.
 #define CONFIG_ESP_FACE_DETECT_ENABLED 0
 #define CONFIG_ESP_FACE_RECOGNITION_ENABLED 0
-#endif
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
 
@@ -1208,18 +1198,13 @@ void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 26;
+    config.lru_purge_enable = true;
 
     httpd_uri_t index_uri = {
         .uri = "/",
         .method = HTTP_GET,
         .handler = index_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t status_uri = {
@@ -1227,12 +1212,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = status_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t cmd_uri = {
@@ -1240,12 +1219,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = cmd_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t capture_uri = {
@@ -1253,12 +1226,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = capture_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t stream_uri = {
@@ -1266,12 +1233,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = stream_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t bmp_uri = {
@@ -1279,12 +1240,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = bmp_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t xclk_uri = {
@@ -1292,12 +1247,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = xclk_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t reg_uri = {
@@ -1305,12 +1254,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = reg_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t greg_uri = {
@@ -1318,12 +1261,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = greg_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t pll_uri = {
@@ -1331,12 +1268,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = pll_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     httpd_uri_t win_uri = {
@@ -1344,12 +1275,6 @@ void startCameraServer()
         .method = HTTP_GET,
         .handler = win_handler,
         .user_ctx = NULL
-#ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
-#endif
     };
 
     ra_filter_init(&ra_filter, 20);
@@ -1388,6 +1313,11 @@ void startCameraServer()
 httpd_handle_t getCameraHttpd()
 {
     return camera_httpd;
+}
+
+httpd_handle_t getStreamHttpd()
+{
+    return stream_httpd;
 }
 
 void setupLedFlash(int pin) 

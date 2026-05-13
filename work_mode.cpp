@@ -7,9 +7,11 @@
 #include "device_api.h"
 #include "mic_stream.h"
 #include "net_config.h"
+#include "speaker_stream.h"
 
 void startCameraServer();
 httpd_handle_t getCameraHttpd();
+httpd_handle_t getStreamHttpd();
 
 namespace {
 
@@ -35,6 +37,8 @@ bool connectWifi(const String &ssid, const String &password) {
     if (millis() - start > kWifiTimeoutMs) {
       Serial.println();
       Serial.println("[work_mode] WiFi connect timeout");
+      WiFi.disconnect(false, true);
+      delay(200);
       return false;
     }
     delay(250);
@@ -63,7 +67,7 @@ void startMdns() {
 
 namespace WorkMode {
 
-bool start() {
+bool connectNetwork() {
   String ssid, password;
   if (!NetConfig::loadWifi(ssid, password) || ssid.length() == 0) {
     Serial.println("[work_mode] no WiFi credentials in NVS");
@@ -73,7 +77,10 @@ bool start() {
   if (!connectWifi(ssid, password)) {
     return false;
   }
+  return true;
+}
 
+bool startServices() {
   startMdns();
 
   startCameraServer();
@@ -84,6 +91,9 @@ bool start() {
   if (MicStream::begin()) {
     MicStream::registerWsHandler(server);
   }
+  if (SpeakerStream::begin()) {
+    SpeakerStream::registerWsHandler(getStreamHttpd());
+  }
 
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
@@ -93,6 +103,13 @@ bool start() {
   g_active = true;
   g_startupMs = millis();
   return true;
+}
+
+bool start() {
+  if (!connectNetwork()) {
+    return false;
+  }
+  return startServices();
 }
 
 void loop() {
