@@ -68,6 +68,11 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
   cJSON_AddNumberToObject(root, "mic_ws_clients", MicStream::clientCount());
   cJSON_AddNumberToObject(root, "mic_bytes_read", (double)MicStream::bytesRead());
   cJSON_AddNumberToObject(root, "mic_frames_sent", (double)MicStream::framesSent());
+  cJSON_AddBoolToObject(root, "wake_ready", MicStream::isWakeReady());
+  cJSON_AddStringToObject(root, "wake_model", MicStream::wakeModel());
+  cJSON_AddNumberToObject(root, "wake_detections", (double)MicStream::wakeDetections());
+  cJSON_AddNumberToObject(root, "wake_last_ms", (double)MicStream::lastWakeMs());
+  cJSON_AddNumberToObject(root, "wake_event_clients", MicStream::wakeEventClientCount());
   cJSON_AddBoolToObject(root, "speaker_streaming", SpeakerStream::isRunning());
   cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
 

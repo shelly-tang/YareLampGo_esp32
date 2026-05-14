@@ -15,6 +15,11 @@ bool isAecReady();
 int clientCount();
 uint32_t bytesRead();
 uint32_t framesSent();
+bool isWakeReady();
+const char *wakeModel();
+uint32_t wakeDetections();
+uint32_t lastWakeMs();
+int wakeEventClientCount();
 
 }
 
