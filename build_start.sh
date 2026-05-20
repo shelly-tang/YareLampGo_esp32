@@ -3,7 +3,7 @@ set -e
 
 FQBN="esp32:esp32:XIAO_ESP32S3:PSRAM=opi"
 BUILD_PATH="/private/tmp/lampgo_esp32_camera_build"
-MODEL_BUILD_PATH="/private/tmp/lampgo_jarvis_model_build"
+MODEL_BUILD_PATH="/private/tmp/lampgo_wakenet_model_build"
 ESP_SR_PATH="${ESP_SR_PATH:-/private/tmp/esp-sr-master-src}"
 ESP_SR_ZIP="/private/tmp/esp-sr-master.zip"
 ESPTOOL="${ESPTOOL:-$HOME/Library/Arduino15/packages/esp32/tools/esptool_py/5.2.0/esptool}"
@@ -17,16 +17,26 @@ arduino-cli compile \
   --build-path "$BUILD_PATH" \
   .
 
-if [ ! -f "$ESP_SR_PATH/model/movemodel.py" ]; then
-  echo "Downloading ESP-SR model source for Jarvis WakeNet..."
-  curl -L --fail https://github.com/espressif/esp-sr/archive/refs/heads/master.zip -o "$ESP_SR_ZIP"
+if [ ! -f "$ESP_SR_PATH/model/movemodel.py" ] || [ ! -f "$ESP_SR_PATH/model/wakenet_model/wn9_xiaoyaxiaoya_tts2/wn9_data" ]; then
+  if [ ! -f "$ESP_SR_ZIP" ]; then
+    echo "Downloading ESP-SR model source for WakeNet models..."
+    curl -L --fail https://github.com/espressif/esp-sr/archive/refs/heads/master.zip -o "$ESP_SR_ZIP"
+  else
+    echo "Using cached ESP-SR model source archive: $ESP_SR_ZIP"
+  fi
   rm -rf /private/tmp/esp-sr-master /private/tmp/esp-sr-master-src
-  unzip -q "$ESP_SR_ZIP" -d /private/tmp
+  unzip -oq "$ESP_SR_ZIP" -d /private/tmp
   mv /private/tmp/esp-sr-master "$ESP_SR_PATH"
 fi
 
 mkdir -p "$MODEL_BUILD_PATH"
-printf "%s\n" "CONFIG_SR_WN_WN9_JARVIS_TTS=y" > "$MODEL_BUILD_PATH/sdkconfig"
+cat > "$MODEL_BUILD_PATH/sdkconfig" <<'EOF'
+CONFIG_SR_WN_WN9_JARVIS_TTS=y
+CONFIG_SR_WN_WN9_XIAOMEITONGXUE_TTS=y
+CONFIG_SR_WN_WN9_XIAOYAXIAOYA_TTS2=y
+CONFIG_SR_WN_WN9_XIAOLUXIAOLU_TTS2=y
+CONFIG_SR_WN_WN9_HIXIAOXING_TTS=y
+EOF
 python "$ESP_SR_PATH/model/movemodel.py" \
   -d1 "$MODEL_BUILD_PATH/sdkconfig" \
   -d2 "$ESP_SR_PATH" \

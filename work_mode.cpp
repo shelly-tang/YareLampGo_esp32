@@ -88,11 +88,11 @@ bool startServices() {
   httpd_handle_t server = getCameraHttpd();
   DeviceApi::registerHandlers(server);
 
-  if (MicStream::begin()) {
-    MicStream::registerWsHandler(server);
-  }
   if (SpeakerStream::begin()) {
     SpeakerStream::registerWsHandler(getStreamHttpd());
+  }
+  if (MicStream::begin()) {
+    MicStream::registerWsHandler(getStreamHttpd());
   }
 
   Serial.print("Camera Ready! Use 'http://");

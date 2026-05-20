@@ -1,6 +1,7 @@
 #include "speaker_stream.h"
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <ESP_I2S.h>
 #include <esp_heap_caps.h>
 #include <esp_http_server.h>
@@ -9,6 +10,8 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <string.h>
+
+#include "net_config.h"
 
 // MAX98357A I2S pins (Seeed XIAO ESP32S3 pin labels from user's wiring)
 #define SPK_I2S_BCLK_PIN 1  // D0 -> GPIO1
@@ -24,6 +27,7 @@
 #define SPK_UPSAMPLE_FACTOR (SPK_OUTPUT_SAMPLE_RATE / SPK_INPUT_SAMPLE_RATE)  // 3
 #define SPK_MAX_FRAME_BYTES 4096
 #define SPK_QUEUE_DEPTH 12
+#define SPK_DEFAULT_VOLUME 0.7f
 // AEC reference ring keeps 16 kHz samples (same rate as mic).
 // Keep one second in PSRAM; older reference audio is not useful for AEC and
 // costs scarce internal SRAM.
@@ -38,11 +42,16 @@ QueueHandle_t g_audioQueue = nullptr;
 TaskHandle_t g_playTask = nullptr;
 volatile bool g_playRunning = false;
 SemaphoreHandle_t g_refMutex = nullptr;
+httpd_handle_t g_server = nullptr;
+int g_clientFd = -1;
 int16_t *g_refRing = nullptr;
 size_t g_refRead = 0;
 size_t g_refWrite = 0;
 size_t g_refCount = 0;
-float g_volume = 0.7f;
+float g_volume = SPK_DEFAULT_VOLUME;
+
+const char *kSpeakerPrefsNamespace = "lampgo-audio";
+const char *kSpeakerVolumeKey = "speaker_volume";
 
 struct AudioPacket {
   uint8_t *data;
@@ -50,6 +59,57 @@ struct AudioPacket {
 };
 
 void playTaskFn(void *);
+
+bool extractQueryValue(httpd_req_t *req, const char *key, char *out, size_t outLen) {
+  if (!req || !key || !out || outLen == 0) return false;
+  out[0] = 0;
+  char query[256] = {};
+  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+  return httpd_query_key_value(query, key, out, outLen) == ESP_OK && out[0] != 0;
+}
+
+bool authorizeWsRequest(httpd_req_t *req, char *ownerOut, size_t ownerOutLen) {
+  char owner[80] = {};
+  char token[128] = {};
+  bool hasOwner = extractQueryValue(req, "owner", owner, sizeof(owner));
+  bool hasToken = extractQueryValue(req, "token", token, sizeof(token));
+  if (!hasOwner || !hasToken) {
+    Serial.println("[speaker_stream] WS reject reason=missing_owner_token");
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "missing owner token");
+    return false;
+  }
+  if (!NetConfig::verifyPairing(String(owner), String(token))) {
+    Serial.printf("[speaker_stream] WS reject owner=%s reason=pairing_mismatch\n", owner);
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "pairing mismatch");
+    return false;
+  }
+  strlcpy(ownerOut, owner, ownerOutLen);
+  return true;
+}
+
+float clampVolume(float volume) {
+  if (volume < 0.0f) return 0.0f;
+  if (volume > 1.0f) return 1.0f;
+  return volume;
+}
+
+void loadVolumePreference() {
+  Preferences prefs;
+  if (!prefs.begin(kSpeakerPrefsNamespace, true)) {
+    g_volume = SPK_DEFAULT_VOLUME;
+    return;
+  }
+  g_volume = clampVolume(prefs.getFloat(kSpeakerVolumeKey, SPK_DEFAULT_VOLUME));
+  prefs.end();
+  Serial.printf("[speaker_stream] loaded volume=%.2f\n", g_volume);
+}
+
+void saveVolumePreference(float volume) {
+  Preferences prefs;
+  if (!prefs.begin(kSpeakerPrefsNamespace, false)) return;
+  prefs.putFloat(kSpeakerVolumeKey, clampVolume(volume));
+  prefs.end();
+}
 
 bool ensurePlayTaskRunning() {
   if (g_playRunning) return true;
@@ -203,7 +263,12 @@ void enqueueAudio(const uint8_t *payload, size_t len) {
 esp_err_t wsSpeakerHandler(httpd_req_t *req) {
   if (req->method == HTTP_GET) {
     int fd = httpd_req_to_sockfd(req);
-    Serial.printf("[speaker_stream] WS handshake fd=%d\n", fd);
+    char owner[80] = {};
+    if (!authorizeWsRequest(req, owner, sizeof(owner))) {
+      return ESP_FAIL;
+    }
+    g_clientFd = fd;
+    Serial.printf("[speaker_stream] WS handshake fd=%d owner=%s\n", fd, owner);
     return ESP_OK;
   }
 
@@ -213,6 +278,8 @@ esp_err_t wsSpeakerHandler(httpd_req_t *req) {
   if (ret != ESP_OK) return ret;
 
   if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+    int fd = httpd_req_to_sockfd(req);
+    if (g_clientFd == fd) g_clientFd = -1;
     Serial.println("[speaker_stream] WS closed");
     return ESP_OK;
   }
@@ -243,6 +310,7 @@ namespace SpeakerStream {
 
 bool begin() {
   if (g_speakerReady) return true;
+  loadVolumePreference();
 
   if (!g_audioQueue) {
     g_audioQueue = xQueueCreate(SPK_QUEUE_DEPTH, sizeof(AudioPacket));
@@ -343,9 +411,8 @@ void clearReference() {
 }
 
 void setVolume(float volume) {
-  if (volume < 0.0f) volume = 0.0f;
-  if (volume > 1.0f) volume = 1.0f;
-  g_volume = volume;
+  g_volume = clampVolume(volume);
+  saveVolumePreference(g_volume);
   Serial.printf("[speaker_stream] volume=%.2f\n", g_volume);
 }
 
@@ -355,6 +422,7 @@ float getVolume() {
 
 bool registerWsHandler(httpd_handle_t server) {
   if (!server || g_handlerRegistered) return false;
+  g_server = server;
 
   httpd_uri_t wsUri = {
     .uri = "/ws/speaker",
@@ -378,6 +446,15 @@ bool registerWsHandler(httpd_handle_t server) {
   g_handlerRegistered = true;
   Serial.println("[speaker_stream] /ws/speaker registered");
   return true;
+}
+
+void closeClients() {
+  if (g_server && g_clientFd >= 0) {
+    int fd = g_clientFd;
+    g_clientFd = -1;
+    httpd_sess_trigger_close(g_server, fd);
+    Serial.printf("[speaker_stream] closed owner-bound client fd=%d\n", fd);
+  }
 }
 
 }  // namespace SpeakerStream

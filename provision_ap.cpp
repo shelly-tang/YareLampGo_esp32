@@ -38,6 +38,8 @@ void handleStatus() {
   cJSON_AddStringToObject(root, "mac", macStr);
   cJSON_AddStringToObject(root, "hostname", NetConfig::deviceHostname().c_str());
   cJSON_AddStringToObject(root, "ap_ssid", NetConfig::apSsid().c_str());
+  cJSON_AddBoolToObject(root, "pairing_supported", true);
+  cJSON_AddBoolToObject(root, "paired", NetConfig::hasPairing());
 
   char *out = cJSON_PrintUnformatted(root);
   g_server.send(200, "application/json", out ? out : "{}");
@@ -87,8 +89,14 @@ void handleConnect() {
 
   const cJSON *ssidJson = cJSON_GetObjectItemCaseSensitive(root, "ssid");
   const cJSON *passJson = cJSON_GetObjectItemCaseSensitive(root, "password");
+  const cJSON *ownerJson = cJSON_GetObjectItemCaseSensitive(root, "owner_id");
+  const cJSON *labelJson = cJSON_GetObjectItemCaseSensitive(root, "owner_label");
+  const cJSON *secretJson = cJSON_GetObjectItemCaseSensitive(root, "pairing_secret");
   const char *ssid = cJSON_IsString(ssidJson) ? ssidJson->valuestring : "";
   const char *pass = cJSON_IsString(passJson) ? passJson->valuestring : "";
+  const char *ownerId = cJSON_IsString(ownerJson) ? ownerJson->valuestring : "";
+  const char *ownerLabel = cJSON_IsString(labelJson) ? labelJson->valuestring : "";
+  const char *pairingSecret = cJSON_IsString(secretJson) ? secretJson->valuestring : "";
 
   if (strlen(ssid) == 0) {
     cJSON_Delete(root);
@@ -97,16 +105,20 @@ void handleConnect() {
   }
 
   bool saved = NetConfig::saveWifi(ssid, pass);
+  bool paired = true;
+  if (strlen(ownerId) > 0 || strlen(pairingSecret) > 0) {
+    paired = NetConfig::savePairing(String(ownerId), String(ownerLabel), String(pairingSecret));
+  }
   cJSON_Delete(root);
 
-  if (!saved) {
+  if (!saved || !paired) {
     g_server.send(500, "application/json", "{\"ok\":false,\"error\":\"nvs save failed\"}");
     return;
   }
 
   g_server.send(200, "application/json", "{\"ok\":true,\"message\":\"restarting\"}");
   g_scheduledRestartMs = millis() + 2000;
-  Serial.println("[provision] credentials saved, restarting in 2s");
+  Serial.printf("[provision] credentials saved, paired=%d owner=%s, restarting in 2s\n", paired ? 1 : 0, ownerId);
 }
 
 void handleNotFound() {

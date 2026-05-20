@@ -12,7 +12,7 @@
 
 namespace {
 
-const char *FIRMWARE_VERSION = "lampgo-cam 0.1.0";
+const char *FIRMWARE_VERSION = "lampgo-cam 0.2.0";
 
 void setJsonHeaders(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
@@ -27,6 +27,61 @@ esp_err_t sendJson(httpd_req_t *req, cJSON *root) {
   if (out) cJSON_free(out);
   cJSON_Delete(root);
   return res;
+}
+
+cJSON *readJsonBody(httpd_req_t *req, size_t maxBytes = 1024) {
+  int total = req->content_len;
+  if (total <= 0 || (size_t)total > maxBytes) {
+    return nullptr;
+  }
+  char *buf = (char *)malloc(total + 1);
+  if (!buf) return nullptr;
+  int received = 0;
+  while (received < total) {
+    int r = httpd_req_recv(req, buf + received, total - received);
+    if (r <= 0) {
+      free(buf);
+      return nullptr;
+    }
+    received += r;
+  }
+  buf[received] = 0;
+  cJSON *doc = cJSON_Parse(buf);
+  free(buf);
+  return doc;
+}
+
+String jsonString(cJSON *doc, const char *key) {
+  if (!doc) return String("");
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(doc, key);
+  return cJSON_IsString(item) && item->valuestring ? String(item->valuestring) : String("");
+}
+
+bool requestAuthorized(cJSON *doc) {
+  if (!NetConfig::hasPairing()) return true;
+  return NetConfig::verifyPairing(jsonString(doc, "owner_id"), jsonString(doc, "pairing_secret"));
+}
+
+esp_err_t sendForbidden(httpd_req_t *req, const char *error) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", false);
+  cJSON_AddStringToObject(root, "error", error);
+  httpd_resp_set_status(req, "403 Forbidden");
+  return sendJson(req, root);
+}
+
+void addPairingStatus(cJSON *root) {
+  String ownerId;
+  String ownerLabel;
+  String secretHash;
+  bool paired = NetConfig::loadPairing(ownerId, ownerLabel, secretHash);
+  cJSON_AddBoolToObject(root, "pairing_supported", true);
+  cJSON_AddBoolToObject(root, "paired", paired);
+  cJSON_AddStringToObject(root, "pairing_state", paired ? "paired" : "unpaired");
+  cJSON_AddStringToObject(root, "paired_owner_id", paired ? ownerId.c_str() : "");
+  cJSON_AddStringToObject(root, "paired_owner_label", paired ? ownerLabel.c_str() : "");
+  cJSON_AddStringToObject(root, "active_owner_id", MicStream::activeOwner());
+  cJSON_AddNumberToObject(root, "owner_lease_remaining_ms", (double)MicStream::ownerLeaseRemainingMs());
 }
 
 esp_err_t deviceStatusHandler(httpd_req_t *req) {
@@ -44,6 +99,7 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
   cJSON_AddStringToObject(root, "mode", "work");
   cJSON_AddStringToObject(root, "firmware", FIRMWARE_VERSION);
   cJSON_AddStringToObject(root, "hostname", NetConfig::deviceHostname().c_str());
+  addPairingStatus(root);
   cJSON_AddStringToObject(root, "ip", WiFi.localIP().toString().c_str());
   cJSON_AddStringToObject(root, "mac", macStr);
   cJSON_AddNumberToObject(root, "rssi", WiFi.RSSI());
@@ -70,9 +126,40 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
   cJSON_AddNumberToObject(root, "mic_frames_sent", (double)MicStream::framesSent());
   cJSON_AddBoolToObject(root, "wake_ready", MicStream::isWakeReady());
   cJSON_AddStringToObject(root, "wake_model", MicStream::wakeModel());
+  cJSON_AddStringToObject(root, "wake_requested_model", MicStream::requestedWakeModel());
+  cJSON *wakeModels = cJSON_AddArrayToObject(root, "wake_supported_models");
+  if (wakeModels) {
+    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_jarvis_tts"));
+    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaomeitongxue_tts"));
+    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoyaxiaoya_tts2"));
+    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoluxiaolu_tts2"));
+    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_hixiaoxing_tts"));
+  }
   cJSON_AddNumberToObject(root, "wake_detections", (double)MicStream::wakeDetections());
   cJSON_AddNumberToObject(root, "wake_last_ms", (double)MicStream::lastWakeMs());
   cJSON_AddNumberToObject(root, "wake_event_clients", MicStream::wakeEventClientCount());
+  cJSON_AddNumberToObject(root, "wake_threshold", MicStream::wakeThreshold());
+  cJSON_AddNumberToObject(root, "wake_afe_gain", MicStream::wakeAfeGain());
+  cJSON_AddNumberToObject(root, "wake_detection_mode", MicStream::wakeDetectionMode());
+  cJSON_AddNumberToObject(root, "wake_afe_feed_samples", MicStream::afeFeedSamples());
+  cJSON_AddNumberToObject(root, "wake_afe_feed_channels", MicStream::afeFeedChannels());
+  cJSON_AddNumberToObject(root, "mic_push_task_create_result", MicStream::pushTaskCreateResult());
+  cJSON_AddNumberToObject(root, "wake_fetch_task_create_result", MicStream::fetchTaskCreateResult());
+  cJSON_AddBoolToObject(root, "wake_inline_fetch", MicStream::isInlineFetch());
+  cJSON_AddNumberToObject(root, "wake_afe_feeds", (double)MicStream::afeFeeds());
+  cJSON_AddNumberToObject(root, "wake_afe_fetch_attempts", (double)MicStream::afeFetchAttempts());
+  cJSON_AddNumberToObject(root, "wake_afe_fetches", (double)MicStream::afeFetches());
+  cJSON_AddNumberToObject(root, "wake_afe_fetch_nulls", (double)MicStream::afeFetchNulls());
+  cJSON_AddNumberToObject(root, "wake_afe_last_ret", MicStream::lastAfeRet());
+  cJSON_AddNumberToObject(root, "wake_afe_last_ms", (double)MicStream::lastAfeMs());
+  cJSON_AddNumberToObject(root, "wake_afe_last_state", MicStream::lastWakeupState());
+  cJSON_AddNumberToObject(root, "wake_afe_last_word_index", MicStream::lastWakeWordIndex());
+  cJSON_AddNumberToObject(root, "wake_afe_last_trigger_channel", MicStream::lastTriggerChannel());
+  cJSON_AddNumberToObject(root, "wake_afe_last_vad_state", MicStream::lastVadState());
+  cJSON_AddNumberToObject(root, "wake_afe_last_volume_db", MicStream::lastAfeVolumeDb());
+  cJSON_AddNumberToObject(root, "wake_afe_ring_free_pct", MicStream::lastAfeRingFreePct());
+  cJSON_AddNumberToObject(root, "mic_last_rms", (double)MicStream::lastMicRms());
+  cJSON_AddNumberToObject(root, "mic_last_peak", (double)MicStream::lastMicPeak());
   cJSON_AddBoolToObject(root, "speaker_streaming", SpeakerStream::isRunning());
   cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
 
@@ -102,22 +189,15 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
     return ESP_FAIL;
   }
 
-  char buf[1025];
-  int received = 0;
-  while (received < total) {
-    int r = httpd_req_recv(req, buf + received, total - received);
-    if (r <= 0) {
-      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
-      return ESP_FAIL;
-    }
-    received += r;
-  }
-  buf[received] = 0;
-
-  cJSON *doc = cJSON_Parse(buf);
+  cJSON *doc = readJsonBody(req, 1024);
   if (!doc) {
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
     return ESP_FAIL;
+  }
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    Serial.println("[device_api] /device/config rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
   }
 
   sensor_t *sensor = esp_camera_sensor_get();
@@ -187,11 +267,137 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
     applied++;
   }
 
+  item = cJSON_GetObjectItemCaseSensitive(doc, "wake_model");
+  if (cJSON_IsString(item) && item->valuestring) {
+    if (!MicStream::setWakeModel(item->valuestring)) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported wake_model");
+      return ESP_FAIL;
+    }
+    applied++;
+  }
+
   cJSON_Delete(doc);
 
   char reply[64];
   snprintf(reply, sizeof(reply), "{\"ok\":true,\"applied\":%d}", applied);
   return httpd_resp_sendstr(req, reply);
+}
+
+esp_err_t devicePairHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    return ESP_FAIL;
+  }
+  String ownerId = jsonString(doc, "owner_id");
+  String ownerLabel = jsonString(doc, "owner_label");
+  String secret = jsonString(doc, "pairing_secret");
+  if (ownerId.length() == 0 || secret.length() == 0) {
+    cJSON_Delete(doc);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "owner_id and pairing_secret required");
+    return ESP_FAIL;
+  }
+
+  String pairedOwner;
+  String pairedLabel;
+  String pairedHash;
+  if (NetConfig::loadPairing(pairedOwner, pairedLabel, pairedHash) &&
+      !NetConfig::verifyPairing(ownerId, secret)) {
+    cJSON_Delete(doc);
+    Serial.printf("[device_api] /device/pair rejected owner=%s paired_owner=%s\n", ownerId.c_str(), pairedOwner.c_str());
+    return sendForbidden(req, "already_paired");
+  }
+
+  bool ok = NetConfig::savePairing(ownerId, ownerLabel, secret);
+  cJSON_Delete(doc);
+  if (!ok) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "pair save failed");
+    return ESP_FAIL;
+  }
+  MicStream::claimOwner(ownerId.c_str(), 120000);
+  MicStream::closeClients();
+  Serial.printf("[device_api] paired owner=%s label=%s\n", ownerId.c_str(), ownerLabel.c_str());
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  addPairingStatus(root);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceUnpairHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    return ESP_FAIL;
+  }
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    Serial.println("[device_api] /device/unpair rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  String ownerId = jsonString(doc, "owner_id");
+  cJSON_Delete(doc);
+  NetConfig::clearPairing();
+  MicStream::releaseOwner(ownerId.c_str());
+  MicStream::closeClients();
+  Serial.printf("[device_api] unpaired owner=%s\n", ownerId.c_str());
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  addPairingStatus(root);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceClaimHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    return ESP_FAIL;
+  }
+  if (!NetConfig::hasPairing()) {
+    cJSON_Delete(doc);
+    httpd_resp_set_status(req, "409 Conflict");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"not_paired\"}");
+  }
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    Serial.println("[device_api] /device/claim rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  String ownerId = jsonString(doc, "owner_id");
+  const cJSON *ttlJson = cJSON_GetObjectItemCaseSensitive(doc, "ttl_ms");
+  uint32_t ttlMs = cJSON_IsNumber(ttlJson) ? (uint32_t)ttlJson->valuedouble : 120000;
+  if (ttlMs < 10000) ttlMs = 10000;
+  if (ttlMs > 600000) ttlMs = 600000;
+  cJSON_Delete(doc);
+  MicStream::claimOwner(ownerId.c_str(), ttlMs);
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  addPairingStatus(root);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceReleaseHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    return ESP_FAIL;
+  }
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    Serial.println("[device_api] /device/release rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  String ownerId = jsonString(doc, "owner_id");
+  cJSON_Delete(doc);
+  MicStream::releaseOwner(ownerId.c_str());
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  addPairingStatus(root);
+  return sendJson(req, root);
 }
 
 esp_err_t deviceRebootHandler(httpd_req_t *req) {
@@ -206,6 +412,23 @@ esp_err_t deviceRebootHandler(httpd_req_t *req) {
 
 esp_err_t deviceForgetWifiHandler(httpd_req_t *req) {
   setJsonHeaders(req);
+  cJSON *doc = nullptr;
+  if (req->content_len > 0) {
+    doc = readJsonBody(req, 1024);
+    if (!doc) {
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+      return ESP_FAIL;
+    }
+  }
+  if (NetConfig::hasPairing() && !requestAuthorized(doc)) {
+    if (doc) cJSON_Delete(doc);
+    Serial.println("[device_api] /device/forget-wifi rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  if (doc) cJSON_Delete(doc);
+  NetConfig::clearPairing();
+  MicStream::releaseOwner(nullptr);
+  MicStream::closeClients();
   bool ok = NetConfig::clearWifi();
   char reply[64];
   snprintf(reply, sizeof(reply), "{\"ok\":%s,\"message\":\"will restart\"}", ok ? "true" : "false");
@@ -237,10 +460,18 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/status", .method = HTTP_GET, .handler = deviceStatusHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_GET, .handler = deviceConfigGetHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_POST, .handler = deviceConfigPostHandler, .user_ctx = NULL},
+      {.uri = "/device/pair", .method = HTTP_POST, .handler = devicePairHandler, .user_ctx = NULL},
+      {.uri = "/device/unpair", .method = HTTP_POST, .handler = deviceUnpairHandler, .user_ctx = NULL},
+      {.uri = "/device/claim", .method = HTTP_POST, .handler = deviceClaimHandler, .user_ctx = NULL},
+      {.uri = "/device/release", .method = HTTP_POST, .handler = deviceReleaseHandler, .user_ctx = NULL},
       {.uri = "/device/reboot", .method = HTTP_POST, .handler = deviceRebootHandler, .user_ctx = NULL},
       {.uri = "/device/forget-wifi", .method = HTTP_POST, .handler = deviceForgetWifiHandler, .user_ctx = NULL},
       {.uri = "/device/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/pair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/unpair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/claim", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/release", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/reboot", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/forget-wifi", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
   };
