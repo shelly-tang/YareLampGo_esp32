@@ -5,6 +5,7 @@
 #include "SPI.h"
 
 #include "avi_recorder.h"
+#include "led_serial.h"
 #include "net_config.h"
 #include "provision_ap.h"
 #include "work_mode.h"
@@ -144,6 +145,8 @@ void setup() {
       delay(1000);
     }
   }
+
+  LedSerial::begin();
 
   if (g_sdReady) {
     startRecording();

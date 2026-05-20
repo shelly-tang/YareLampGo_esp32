@@ -6,13 +6,14 @@
 #include <esp_heap_caps.h>
 #include <esp_camera.h>
 
+#include "led_serial.h"
 #include "mic_stream.h"
 #include "net_config.h"
 #include "speaker_stream.h"
 
 namespace {
 
-const char *FIRMWARE_VERSION = "lampgo-cam 0.2.0";
+const char *FIRMWARE_VERSION = "lampgo-cam 0.3.2";
 
 void setJsonHeaders(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
@@ -82,6 +83,32 @@ void addPairingStatus(cJSON *root) {
   cJSON_AddStringToObject(root, "paired_owner_label", paired ? ownerLabel.c_str() : "");
   cJSON_AddStringToObject(root, "active_owner_id", MicStream::activeOwner());
   cJSON_AddNumberToObject(root, "owner_lease_remaining_ms", (double)MicStream::ownerLeaseRemainingMs());
+}
+
+void addLedStatus(cJSON *root) {
+  cJSON_AddBoolToObject(root, "led_ready", LedSerial::isReady());
+  cJSON_AddNumberToObject(root, "led_mode", LedSerial::currentMode());
+  cJSON_AddStringToObject(root, "led_mode_name", LedSerial::modeName(LedSerial::currentMode()));
+  cJSON_AddNumberToObject(root, "led_brightness", LedSerial::currentBrightness());
+  cJSON_AddStringToObject(root, "led_last_command", LedSerial::lastCommand());
+  cJSON_AddNumberToObject(root, "led_last_write_ms", (double)LedSerial::lastWriteMs());
+  cJSON_AddStringToObject(root, "led_driver", LedSerial::driverName());
+  cJSON_AddNumberToObject(root, "led_pixel_pin", LedSerial::pixelPin());
+  cJSON_AddNumberToObject(root, "led_pixel_count", LedSerial::pixelCount());
+  cJSON_AddNumberToObject(root, "led_panel_count", LedSerial::panelCount());
+  cJSON_AddBoolToObject(root, "led_output_ok", LedSerial::outputOk());
+}
+
+void addLedSupportedModes(cJSON *root) {
+  cJSON *modes = cJSON_AddArrayToObject(root, "led_supported_modes");
+  if (!modes) return;
+  for (int mode = 0; mode <= 29; ++mode) {
+    cJSON *item = cJSON_CreateObject();
+    if (!item) continue;
+    cJSON_AddNumberToObject(item, "mode", mode);
+    cJSON_AddStringToObject(item, "name", LedSerial::modeName(mode));
+    cJSON_AddItemToArray(modes, item);
+  }
 }
 
 esp_err_t deviceStatusHandler(httpd_req_t *req) {
@@ -162,6 +189,7 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
   cJSON_AddNumberToObject(root, "mic_last_peak", (double)MicStream::lastMicPeak());
   cJSON_AddBoolToObject(root, "speaker_streaming", SpeakerStream::isRunning());
   cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
+  addLedStatus(root);
 
   if (sensor != nullptr) {
     cJSON_AddNumberToObject(root, "framesize", sensor->status.framesize);
@@ -282,6 +310,108 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
   char reply[64];
   snprintf(reply, sizeof(reply), "{\"ok\":true,\"applied\":%d}", applied);
   return httpd_resp_sendstr(req, reply);
+}
+
+esp_err_t deviceLedGetHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  addLedStatus(root);
+  addLedSupportedModes(root);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceLedPostHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    return ESP_FAIL;
+  }
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    Serial.println("[device_api] /device/led rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  if (!LedSerial::isReady()) {
+    cJSON_Delete(doc);
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"led_not_ready\"}");
+  }
+
+  int applied = 0;
+
+  const cJSON *brightnessJson = cJSON_GetObjectItemCaseSensitive(doc, "brightness");
+  if (cJSON_IsNumber(brightnessJson)) {
+    int brightness = brightnessJson->valueint;
+    if (brightness < 1 || brightness > 255) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "brightness must be 1-255");
+      return ESP_FAIL;
+    }
+    if (!LedSerial::setBrightness(brightness)) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led brightness apply failed");
+      return ESP_FAIL;
+    }
+    Serial.printf("[device_api] /device/led brightness=%d\n", brightness);
+    applied++;
+  }
+
+  int mode = -1;
+  bool modeRequested = false;
+  const cJSON *modeJson = cJSON_GetObjectItemCaseSensitive(doc, "mode");
+  modeRequested = modeJson != nullptr;
+  if (cJSON_IsNumber(modeJson)) {
+    mode = modeJson->valueint;
+  } else if (cJSON_IsString(modeJson) && modeJson->valuestring) {
+    mode = LedSerial::resolveMode(modeJson->valuestring);
+  }
+  if (mode < 0) {
+    const cJSON *expressionJson = cJSON_GetObjectItemCaseSensitive(doc, "expression");
+    modeRequested = modeRequested || expressionJson != nullptr;
+    if (!cJSON_IsString(expressionJson) || !expressionJson->valuestring) {
+      expressionJson = cJSON_GetObjectItemCaseSensitive(doc, "name");
+      modeRequested = modeRequested || expressionJson != nullptr;
+    }
+    if (cJSON_IsString(expressionJson) && expressionJson->valuestring) {
+      mode = LedSerial::resolveMode(expressionJson->valuestring);
+    }
+  }
+
+  if (mode >= 0) {
+    if (mode > 29) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be 0-29");
+      return ESP_FAIL;
+    }
+    if (!LedSerial::setMode(mode)) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "led mode apply failed");
+      return ESP_FAIL;
+    }
+    Serial.printf("[device_api] /device/led mode=%d name=%s\n", mode, LedSerial::modeName(mode));
+    applied++;
+  } else if (modeRequested) {
+    cJSON_Delete(doc);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown led mode");
+    return ESP_FAIL;
+  }
+
+  cJSON_Delete(doc);
+
+  if (applied == 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode/expression or brightness required");
+    return ESP_FAIL;
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddNumberToObject(root, "applied", applied);
+  addLedStatus(root);
+  addLedSupportedModes(root);
+  return sendJson(req, root);
 }
 
 esp_err_t devicePairHandler(httpd_req_t *req) {
@@ -460,6 +590,8 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/status", .method = HTTP_GET, .handler = deviceStatusHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_GET, .handler = deviceConfigGetHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_POST, .handler = deviceConfigPostHandler, .user_ctx = NULL},
+      {.uri = "/device/led", .method = HTTP_GET, .handler = deviceLedGetHandler, .user_ctx = NULL},
+      {.uri = "/device/led", .method = HTTP_POST, .handler = deviceLedPostHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_POST, .handler = devicePairHandler, .user_ctx = NULL},
       {.uri = "/device/unpair", .method = HTTP_POST, .handler = deviceUnpairHandler, .user_ctx = NULL},
       {.uri = "/device/claim", .method = HTTP_POST, .handler = deviceClaimHandler, .user_ctx = NULL},
@@ -468,6 +600,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/forget-wifi", .method = HTTP_POST, .handler = deviceForgetWifiHandler, .user_ctx = NULL},
       {.uri = "/device/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/unpair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/claim", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
