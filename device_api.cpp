@@ -102,7 +102,7 @@ void addLedStatus(cJSON *root) {
 void addLedSupportedModes(cJSON *root) {
   cJSON *modes = cJSON_AddArrayToObject(root, "led_supported_modes");
   if (!modes) return;
-  for (int mode = 0; mode <= 29; ++mode) {
+  for (int mode = 0; mode <= 32; ++mode) {
     cJSON *item = cJSON_CreateObject();
     if (!item) continue;
     cJSON_AddNumberToObject(item, "mode", mode);
@@ -381,9 +381,9 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
   }
 
   if (mode >= 0) {
-    if (mode > 29) {
+    if (mode > 32) {
       cJSON_Delete(doc);
-      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be 0-29");
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be 0-32");
       return ESP_FAIL;
     }
     if (!LedSerial::setMode(mode)) {
