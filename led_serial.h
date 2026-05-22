@@ -14,6 +14,7 @@ bool setBrightness(int brightness);
 
 int resolveMode(const char *name);
 const char *modeName(int mode);
+int maxMode();
 
 int currentMode();
 int currentBrightness();

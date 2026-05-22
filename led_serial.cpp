@@ -33,7 +33,7 @@ namespace {
 constexpr int kPanelRows = 8;
 constexpr int kPanelCols = 8;
 constexpr int kCombinedCols = 16;
-constexpr int kMaxMode = 32;
+constexpr int kMaxMode = 33;
 
 SemaphoreHandle_t g_mutex = nullptr;
 TaskHandle_t g_task = nullptr;
@@ -90,6 +90,7 @@ const char *const kModeNames[kMaxMode + 1] = {
     "cool",
     "focused",
     "wink",
+    "myu7gt",
 };
 
 const uint8_t kCheckPattern[8][8] = {
@@ -401,6 +402,16 @@ const uint8_t kCombinedPatterns[][8][16] = {
         {0,0,1,1,1,1,0,0, 0,0,1,1,1,1,0,0},
         {0,0,0,1,1,0,0,0, 0,0,0,1,1,0,0,0},
     },
+    {
+        {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
+        {1,0,1,0,0,1,1,1, 0,2,2,2,2,0,0,0},
+        {1,0,1,0,0,0,0,1, 0,2,0,0,0,2,2,2},
+        {1,1,1,0,0,0,0,1, 0,2,0,2,2,0,2,0},
+        {0,1,0,1,0,1,0,1, 0,2,0,0,2,0,2,0},
+        {0,1,0,1,0,1,0,1, 0,2,2,2,2,0,2,0},
+        {0,1,0,1,1,1,0,1, 0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
+    },
 };
 
 struct ModeAlias {
@@ -436,6 +447,11 @@ const ModeAlias kAliases[] = {
     {"cool", 30},
     {"focused", 31},
     {"wink", 32},
+    {"myu7gt", 33},
+    {"myu7", 33},
+    {"mgt", 33},
+    {"yu7gt", 33},
+    {"yu7", 33},
 };
 
 void normalizeKey(const char *input, char *out, size_t outLen) {
@@ -913,6 +929,9 @@ void renderCurrentLocked() {
     case 32:
       renderWink(g_animFrame);
       break;
+    case 33:
+      drawCombinedPattern(22, color(g_brightness, g_brightness, g_brightness), color(g_brightness, 0, 0));
+      break;
     default:
       clearPixels();
       break;
@@ -1104,6 +1123,10 @@ const char *modeName(int mode) {
     return "unknown";
   }
   return kModeNames[mode];
+}
+
+int maxMode() {
+  return kMaxMode;
 }
 
 int currentMode() {
