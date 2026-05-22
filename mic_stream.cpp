@@ -52,6 +52,7 @@
 #define AFE_INPUT_FORMAT  "MR"
 #define AFE_FILTER_LENGTH 4
 #define DEFAULT_WAKE_MODEL "wn9_jarvis_tts"
+#define WS_SEND_STALE_MS 1500
 
 namespace {
 
@@ -72,8 +73,18 @@ httpd_handle_t g_server = nullptr;
 struct WsClient {
   int fd;
   bool active;
+  bool sending;
+  uint32_t sendingSinceMs;
   char owner[80];
 };
+
+struct PendingWsFrame {
+  int fd;
+  bool eventClient;
+  httpd_ws_frame_t frame;
+  uint8_t *payload;
+};
+
 WsClient g_clients[MAX_WS_CLIENTS] = {};
 WsClient g_eventClients[MAX_EVENT_CLIENTS] = {};
 SemaphoreHandle_t g_clientMutex = nullptr;
@@ -180,12 +191,34 @@ bool authorizeWsRequest(httpd_req_t *req, char *ownerOut, size_t ownerOutLen, co
   return true;
 }
 
+uint8_t *clonePayload(const uint8_t *payload, size_t len) {
+  if (!payload || len == 0) return nullptr;
+  uint8_t *copy = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!copy) {
+    copy = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_8BIT);
+  }
+  if (!copy) return nullptr;
+  memcpy(copy, payload, len);
+  return copy;
+}
+
+void freePendingWsFrame(PendingWsFrame *pending) {
+  if (!pending) return;
+  if (pending->payload) {
+    heap_caps_free(pending->payload);
+    pending->payload = nullptr;
+  }
+  free(pending);
+}
+
 void addClient(int fd, const char *owner) {
   xSemaphoreTake(g_clientMutex, portMAX_DELAY);
   for (int i = 0; i < MAX_WS_CLIENTS; i++) {
     if (!g_clients[i].active) {
       g_clients[i].fd = fd;
       g_clients[i].active = true;
+      g_clients[i].sending = false;
+      g_clients[i].sendingSinceMs = 0;
       strlcpy(g_clients[i].owner, owner ? owner : "", sizeof(g_clients[i].owner));
       Serial.printf("[mic_stream] client added fd=%d slot=%d owner=%s\n", fd, i, g_clients[i].owner);
       xSemaphoreGive(g_clientMutex);
@@ -202,6 +235,8 @@ void removeClient(int fd) {
   for (int i = 0; i < MAX_WS_CLIENTS; i++) {
     if (g_clients[i].active && g_clients[i].fd == fd) {
       g_clients[i].active = false;
+      g_clients[i].sending = false;
+      g_clients[i].sendingSinceMs = 0;
       g_clients[i].owner[0] = 0;
       Serial.printf("[mic_stream] client removed fd=%d\n", fd);
       break;
@@ -226,6 +261,8 @@ void addEventClient(int fd, const char *owner) {
     if (!g_eventClients[i].active) {
       g_eventClients[i].fd = fd;
       g_eventClients[i].active = true;
+      g_eventClients[i].sending = false;
+      g_eventClients[i].sendingSinceMs = 0;
       strlcpy(g_eventClients[i].owner, owner ? owner : "", sizeof(g_eventClients[i].owner));
       Serial.printf("[mic_stream] event client added fd=%d slot=%d owner=%s\n", fd, i, g_eventClients[i].owner);
       xSemaphoreGive(g_eventClientMutex);
@@ -242,6 +279,8 @@ void removeEventClient(int fd) {
   for (int i = 0; i < MAX_EVENT_CLIENTS; i++) {
     if (g_eventClients[i].active && g_eventClients[i].fd == fd) {
       g_eventClients[i].active = false;
+      g_eventClients[i].sending = false;
+      g_eventClients[i].sendingSinceMs = 0;
       g_eventClients[i].owner[0] = 0;
       Serial.printf("[mic_stream] event client removed fd=%d\n", fd);
       break;
@@ -260,6 +299,146 @@ int activeEventClientCount() {
   return count;
 }
 
+bool setClientSending(int fd, bool eventClient, bool sending) {
+  SemaphoreHandle_t mutex = eventClient ? g_eventClientMutex : g_clientMutex;
+  WsClient *clients = eventClient ? g_eventClients : g_clients;
+  int maxClients = eventClient ? MAX_EVENT_CLIENTS : MAX_WS_CLIENTS;
+  if (!mutex) return false;
+
+  bool found = false;
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  for (int i = 0; i < maxClients; i++) {
+    if (clients[i].active && clients[i].fd == fd) {
+      clients[i].sending = sending;
+      clients[i].sendingSinceMs = sending ? millis() : 0;
+      found = true;
+      break;
+    }
+  }
+  xSemaphoreGive(mutex);
+  return found;
+}
+
+int collectReadyClientFds(bool eventClient, int *fds, int maxFds) {
+  if (!fds || maxFds <= 0) return 0;
+  SemaphoreHandle_t mutex = eventClient ? g_eventClientMutex : g_clientMutex;
+  WsClient *clients = eventClient ? g_eventClients : g_clients;
+  int maxClients = eventClient ? MAX_EVENT_CLIENTS : MAX_WS_CLIENTS;
+  if (!mutex) return 0;
+
+  int fdCount = 0;
+  int staleFds[MAX_WS_CLIENTS > MAX_EVENT_CLIENTS ? MAX_WS_CLIENTS : MAX_EVENT_CLIENTS] = {};
+  int staleCount = 0;
+  uint32_t now = millis();
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  for (int i = 0; i < maxClients && fdCount < maxFds; i++) {
+    if (!clients[i].active) continue;
+    if (clients[i].sending) {
+      if (clients[i].sendingSinceMs != 0 &&
+          (uint32_t)(now - clients[i].sendingSinceMs) > WS_SEND_STALE_MS &&
+          staleCount < maxClients) {
+        staleFds[staleCount++] = clients[i].fd;
+        clients[i].active = false;
+        clients[i].sending = false;
+        clients[i].sendingSinceMs = 0;
+        clients[i].owner[0] = 0;
+      }
+      continue;
+    }
+    clients[i].sending = true;
+    clients[i].sendingSinceMs = now;
+    fds[fdCount++] = clients[i].fd;
+  }
+  xSemaphoreGive(mutex);
+
+  for (int i = 0; i < staleCount; i++) {
+    Serial.printf("[mic_stream] stale async send fd=%d, closing\n", staleFds[i]);
+    if (g_server) httpd_sess_trigger_close(g_server, staleFds[i]);
+  }
+  return fdCount;
+}
+
+void wsSendComplete(esp_err_t err, int socket, void *arg) {
+  PendingWsFrame *pending = (PendingWsFrame *)arg;
+  if (!pending) return;
+
+  setClientSending(socket, pending->eventClient, false);
+  if (err != ESP_OK) {
+    Serial.printf("[mic_stream] async send complete failed fd=%d type=%d err=%d\n",
+                  socket, (int)pending->frame.type, err);
+    if (pending->eventClient) {
+      removeEventClient(socket);
+    } else {
+      removeClient(socket);
+    }
+  } else if (!pending->eventClient && pending->frame.type == HTTPD_WS_TYPE_BINARY) {
+    g_framesSent++;
+  }
+
+  freePendingWsFrame(pending);
+}
+
+void wsSendWork(void *arg) {
+  PendingWsFrame *pending = (PendingWsFrame *)arg;
+  if (!pending) return;
+  if (!g_server) {
+    setClientSending(pending->fd, pending->eventClient, false);
+    freePendingWsFrame(pending);
+    return;
+  }
+
+  if (httpd_ws_get_fd_info(g_server, pending->fd) != HTTPD_WS_CLIENT_WEBSOCKET) {
+    if (pending->eventClient) {
+      removeEventClient(pending->fd);
+    } else {
+      removeClient(pending->fd);
+    }
+    freePendingWsFrame(pending);
+    return;
+  }
+
+  esp_err_t ret = httpd_ws_send_data_async(g_server, pending->fd, &pending->frame,
+                                           wsSendComplete, pending);
+  if (ret != ESP_OK) {
+    Serial.printf("[mic_stream] async send failed fd=%d type=%d err=%d\n",
+                  pending->fd, (int)pending->frame.type, ret);
+    setClientSending(pending->fd, pending->eventClient, false);
+    if (pending->eventClient) {
+      removeEventClient(pending->fd);
+    } else {
+      removeClient(pending->fd);
+    }
+    freePendingWsFrame(pending);
+  }
+}
+
+bool queueWsFrame(int fd, const uint8_t *payload, size_t len, httpd_ws_type_t type, bool eventClient) {
+  if (!g_server || fd < 0 || !payload || len == 0) return false;
+
+  PendingWsFrame *pending = (PendingWsFrame *)calloc(1, sizeof(PendingWsFrame));
+  if (!pending) return false;
+
+  pending->payload = clonePayload(payload, len);
+  if (!pending->payload) {
+    freePendingWsFrame(pending);
+    return false;
+  }
+
+  pending->fd = fd;
+  pending->eventClient = eventClient;
+  pending->frame.type = type;
+  pending->frame.payload = pending->payload;
+  pending->frame.len = len;
+
+  esp_err_t ret = httpd_queue_work(g_server, wsSendWork, pending);
+  if (ret != ESP_OK) {
+    Serial.printf("[mic_stream] queue send failed fd=%d type=%d err=%d\n", fd, (int)type, ret);
+    freePendingWsFrame(pending);
+    return false;
+  }
+  return true;
+}
+
 void sendWakeEvent() {
   g_wakeDetections++;
   g_lastWakeMs = millis();
@@ -276,26 +455,12 @@ void sendWakeEvent() {
            (unsigned)g_wakeSeq, (unsigned)millis());
 
   int fds[MAX_EVENT_CLIENTS] = {};
-  int fdCount = 0;
-  xSemaphoreTake(g_eventClientMutex, portMAX_DELAY);
-  for (int i = 0; i < MAX_EVENT_CLIENTS; i++) {
-    if (!g_eventClients[i].active) continue;
-    fds[fdCount++] = g_eventClients[i].fd;
-  }
-  xSemaphoreGive(g_eventClientMutex);
+  int fdCount = collectReadyClientFds(true, fds, MAX_EVENT_CLIENTS);
 
   for (int i = 0; i < fdCount; i++) {
-    if (httpd_ws_get_fd_info(g_server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
-      removeEventClient(fds[i]);
-      continue;
-    }
-    httpd_ws_frame_t frame = {};
-    frame.type = HTTPD_WS_TYPE_TEXT;
-    frame.payload = (uint8_t *)json;
-    frame.len = strlen(json);
-    esp_err_t ret = httpd_ws_send_data(g_server, fds[i], &frame);
-    if (ret != ESP_OK) {
-      Serial.printf("[mic_stream] event send failed fd=%d err=%d, removing\n", fds[i], ret);
+    if (!queueWsFrame(fds[i], (const uint8_t *)json, strlen(json), HTTPD_WS_TYPE_TEXT, true)) {
+      setClientSending(fds[i], true, false);
+      Serial.printf("[mic_stream] event queue failed fd=%d, removing\n", fds[i]);
       removeEventClient(fds[i]);
     }
   }
@@ -305,32 +470,13 @@ void sendAudioFrame(const uint8_t *payload, size_t len) {
   if (!payload || len == 0 || activeClientCount() == 0 || !g_server) return;
 
   int fds[MAX_WS_CLIENTS] = {};
-  int fdCount = 0;
-
-  xSemaphoreTake(g_clientMutex, portMAX_DELAY);
-  for (int i = 0; i < MAX_WS_CLIENTS; i++) {
-    if (!g_clients[i].active) continue;
-    fds[fdCount++] = g_clients[i].fd;
-  }
-  xSemaphoreGive(g_clientMutex);
+  int fdCount = collectReadyClientFds(false, fds, MAX_WS_CLIENTS);
 
   for (int i = 0; i < fdCount; i++) {
-    if (httpd_ws_get_fd_info(g_server, fds[i]) != HTTPD_WS_CLIENT_WEBSOCKET) {
+    if (!queueWsFrame(fds[i], payload, len, HTTPD_WS_TYPE_BINARY, false)) {
+      setClientSending(fds[i], false, false);
+      Serial.printf("[mic_stream] audio queue failed fd=%d, removing\n", fds[i]);
       removeClient(fds[i]);
-      continue;
-    }
-
-    httpd_ws_frame_t frame = {};
-    frame.type = HTTPD_WS_TYPE_BINARY;
-    frame.payload = (uint8_t *)payload;
-    frame.len = len;
-
-    esp_err_t ret = httpd_ws_send_data(g_server, fds[i], &frame);
-    if (ret != ESP_OK) {
-      Serial.printf("[mic_stream] send failed fd=%d err=%d, removing\n", fds[i], ret);
-      removeClient(fds[i]);
-    } else {
-      g_framesSent++;
     }
   }
 }

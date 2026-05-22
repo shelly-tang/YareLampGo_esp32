@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <stdarg.h>
 #include <cJSON.h>
 #include <esp_heap_caps.h>
 #include <esp_camera.h>
@@ -14,6 +15,77 @@
 namespace {
 
 const char *FIRMWARE_VERSION = "lampgo-cam 0.3.2";
+const char *const kWakeSupportedModelsJson =
+    "[\"wn9_jarvis_tts\",\"wn9_xiaomeitongxue_tts\","
+    "\"wn9_xiaoyaxiaoya_tts2\",\"wn9_xiaoluxiaolu_tts2\","
+    "\"wn9_hixiaoxing_tts\"]";
+
+bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
+  if (!dst || !used || !src || *used >= dstLen) return false;
+  while (*src) {
+    if (*used + 1 >= dstLen) return false;
+    dst[*used] = *src;
+    (*used)++;
+    src++;
+  }
+  dst[*used] = '\0';
+  return true;
+}
+
+bool appendFormat(char *dst, size_t dstLen, size_t *used, const char *fmt, ...) {
+  if (!dst || !used || !fmt || *used >= dstLen) return false;
+  va_list args;
+  va_start(args, fmt);
+  int written = vsnprintf(dst + *used, dstLen - *used, fmt, args);
+  va_end(args);
+  if (written < 0 || (size_t)written >= (dstLen - *used)) {
+    if (dstLen > 0) dst[dstLen - 1] = '\0';
+    return false;
+  }
+  *used += (size_t)written;
+  return true;
+}
+
+bool appendJsonEscaped(char *dst, size_t dstLen, size_t *used, const char *src) {
+  if (!src) return true;
+  while (*src) {
+    unsigned char ch = static_cast<unsigned char>(*src++);
+    switch (ch) {
+      case '\"':
+        if (!appendRaw(dst, dstLen, used, "\\\"")) return false;
+        break;
+      case '\\':
+        if (!appendRaw(dst, dstLen, used, "\\\\")) return false;
+        break;
+      case '\b':
+        if (!appendRaw(dst, dstLen, used, "\\b")) return false;
+        break;
+      case '\f':
+        if (!appendRaw(dst, dstLen, used, "\\f")) return false;
+        break;
+      case '\n':
+        if (!appendRaw(dst, dstLen, used, "\\n")) return false;
+        break;
+      case '\r':
+        if (!appendRaw(dst, dstLen, used, "\\r")) return false;
+        break;
+      case '\t':
+        if (!appendRaw(dst, dstLen, used, "\\t")) return false;
+        break;
+      default:
+        if (ch < 0x20) {
+          if (!appendFormat(dst, dstLen, used, "\\u%04x", ch)) return false;
+        } else {
+          if (*used + 1 >= dstLen) return false;
+          dst[*used] = static_cast<char>(ch);
+          (*used)++;
+          dst[*used] = '\0';
+        }
+        break;
+    }
+  }
+  return true;
+}
 
 void setJsonHeaders(httpd_req_t *req) {
   httpd_resp_set_type(req, "application/json");
@@ -111,8 +183,18 @@ void addLedSupportedModes(cJSON *root) {
   }
 }
 
-esp_err_t deviceStatusHandler(httpd_req_t *req) {
-  setJsonHeaders(req);
+void addWakeSupportedModels(cJSON *root) {
+  cJSON *wakeModels = cJSON_AddArrayToObject(root, "wake_supported_models");
+  if (!wakeModels) return;
+  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_jarvis_tts"));
+  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaomeitongxue_tts"));
+  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoyaxiaoya_tts2"));
+  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoluxiaolu_tts2"));
+  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_hixiaoxing_tts"));
+}
+
+bool writeDebugStatusJson(char *body, size_t bodyLen) {
+  if (!body || bodyLen == 0) return false;
 
   sensor_t *sensor = esp_camera_sensor_get();
   uint8_t mac[6] = {0};
@@ -121,76 +203,151 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
   snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+  String hostname = NetConfig::deviceHostname();
+  String ownerId;
+  String ownerLabel;
+  String secretHash;
+  bool paired = NetConfig::loadPairing(ownerId, ownerLabel, secretHash);
+  String ip = WiFi.localIP().toString();
+  String ssid = WiFi.SSID();
+  int ledMode = LedSerial::currentMode();
+
+  size_t used = 0;
+  body[0] = '\0';
+
+  bool ok = true;
+  ok = ok && appendRaw(body, bodyLen, &used, "{");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"configured\":true,\"mode\":\"work\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"firmware\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, FIRMWARE_VERSION);
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"hostname\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, hostname.c_str());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"pairing_supported\":true,\"paired\":%s",
+                           paired ? "true" : "false");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"pairing_state\":\"");
+  ok = ok && appendRaw(body, bodyLen, &used, paired ? "paired" : "unpaired");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"paired_owner_id\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, paired ? ownerId.c_str() : "");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"paired_owner_label\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, paired ? ownerLabel.c_str() : "");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"active_owner_id\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::activeOwner());
+  ok = ok && appendFormat(body, bodyLen, &used, "\",\"owner_lease_remaining_ms\":%.0f",
+                           (double)MicStream::ownerLeaseRemainingMs());
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"ip\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, ip.c_str());
+  ok = ok && appendRaw(body, bodyLen, &used, "\",\"mac\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, macStr);
+  ok = ok && appendFormat(body, bodyLen, &used, "\",\"rssi\":%d", WiFi.RSSI());
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"ssid\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, ssid.c_str());
+  ok = ok && appendFormat(body, bodyLen, &used, "\",\"uptime_ms\":%.0f",
+                           (double)millis());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"free_heap\":%.0f,\"free_psram\":%.0f",
+                           (double)ESP.getFreeHeap(), (double)ESP.getFreePsram());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"internal_free_heap\":%.0f,\"internal_min_free_heap\":%.0f,\"internal_largest_free_block\":%.0f",
+                           (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                           (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                           (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"psram_free_heap\":%.0f,\"psram_min_free_heap\":%.0f,\"psram_largest_free_block\":%.0f",
+                           (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                           (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+                           (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"mic_streaming\":%s,\"mic_aec_ready\":%s,\"mic_ws_clients\":%d",
+                           MicStream::isRunning() ? "true" : "false",
+                           MicStream::isAecReady() ? "true" : "false",
+                           (int)MicStream::clientCount());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"mic_bytes_read\":%.0f,\"mic_frames_sent\":%.0f",
+                           (double)MicStream::bytesRead(), (double)MicStream::framesSent());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"wake_ready\":%s",
+                           MicStream::isWakeReady() ? "true" : "false");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"wake_model\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::wakeModel());
+  ok = ok && appendRaw(body, bodyLen, &used, "\",\"wake_requested_model\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::requestedWakeModel());
+  ok = ok && appendRaw(body, bodyLen, &used, "\",\"wake_supported_models\":");
+  ok = ok && appendRaw(body, bodyLen, &used, kWakeSupportedModelsJson);
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"wake_detections\":%.0f,\"wake_last_ms\":%.0f,\"wake_event_clients\":%d",
+                           (double)MicStream::wakeDetections(), (double)MicStream::lastWakeMs(),
+                           (int)MicStream::wakeEventClientCount());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"wake_threshold\":%.3f,\"wake_afe_gain\":%.3f,\"wake_detection_mode\":%d",
+                           MicStream::wakeThreshold(), MicStream::wakeAfeGain(),
+                           MicStream::wakeDetectionMode());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"wake_afe_feed_samples\":%d,\"wake_afe_feed_channels\":%d",
+                           MicStream::afeFeedSamples(), MicStream::afeFeedChannels());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"mic_push_task_create_result\":%d,\"wake_fetch_task_create_result\":%d,\"wake_inline_fetch\":%s",
+                           MicStream::pushTaskCreateResult(), MicStream::fetchTaskCreateResult(),
+                           MicStream::isInlineFetch() ? "true" : "false");
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"wake_afe_feeds\":%.0f,\"wake_afe_fetch_attempts\":%.0f,\"wake_afe_fetches\":%.0f,\"wake_afe_fetch_nulls\":%.0f",
+                           (double)MicStream::afeFeeds(), (double)MicStream::afeFetchAttempts(),
+                           (double)MicStream::afeFetches(), (double)MicStream::afeFetchNulls());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"wake_afe_last_ret\":%d,\"wake_afe_last_ms\":%.0f,\"wake_afe_last_state\":%d,\"wake_afe_last_word_index\":%d",
+                           MicStream::lastAfeRet(), (double)MicStream::lastAfeMs(),
+                           MicStream::lastWakeupState(), MicStream::lastWakeWordIndex());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"wake_afe_last_trigger_channel\":%d,\"wake_afe_last_vad_state\":%d,\"wake_afe_last_volume_db\":%.3f,\"wake_afe_ring_free_pct\":%.3f",
+                           MicStream::lastTriggerChannel(), MicStream::lastVadState(),
+                           MicStream::lastAfeVolumeDb(), MicStream::lastAfeRingFreePct());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"mic_last_rms\":%.3f,\"mic_last_peak\":%.3f",
+                           (double)MicStream::lastMicRms(), (double)MicStream::lastMicPeak());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"speaker_streaming\":%s,\"speaker_volume\":%.3f",
+                           SpeakerStream::isRunning() ? "true" : "false",
+                           (double)SpeakerStream::getVolume());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_ready\":%s,\"led_mode\":%d",
+                           LedSerial::isReady() ? "true" : "false", ledMode);
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"led_mode_name\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::modeName(ledMode));
+  ok = ok && appendFormat(body, bodyLen, &used, "\",\"led_brightness\":%d",
+                           LedSerial::currentBrightness());
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"led_last_command\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::lastCommand());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           "\",\"led_last_write_ms\":%.0f,\"led_driver\":\"",
+                           (double)LedSerial::lastWriteMs());
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::driverName());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           "\",\"led_pixel_pin\":%d,\"led_pixel_count\":%d,\"led_panel_count\":%d,\"led_output_ok\":%s",
+                           LedSerial::pixelPin(), LedSerial::pixelCount(), LedSerial::panelCount(),
+                           LedSerial::outputOk() ? "true" : "false");
+
+  if (sensor != nullptr) {
+    ok = ok && appendFormat(body, bodyLen, &used,
+                             ",\"framesize\":%d,\"jpeg_quality\":%d,\"brightness\":%d,\"contrast\":%d,\"saturation\":%d,\"hmirror\":%s,\"vflip\":%s",
+                             sensor->status.framesize, sensor->status.quality, sensor->status.brightness,
+                             sensor->status.contrast, sensor->status.saturation,
+                             sensor->status.hmirror ? "true" : "false",
+                             sensor->status.vflip ? "true" : "false");
+  }
+
+  ok = ok && appendRaw(body, bodyLen, &used, "}");
+  return ok;
+}
+
+cJSON *buildConfigJson() {
+  sensor_t *sensor = esp_camera_sensor_get();
   cJSON *root = cJSON_CreateObject();
-  cJSON_AddBoolToObject(root, "configured", true);
-  cJSON_AddStringToObject(root, "mode", "work");
-  cJSON_AddStringToObject(root, "firmware", FIRMWARE_VERSION);
-  cJSON_AddStringToObject(root, "hostname", NetConfig::deviceHostname().c_str());
-  addPairingStatus(root);
-  cJSON_AddStringToObject(root, "ip", WiFi.localIP().toString().c_str());
-  cJSON_AddStringToObject(root, "mac", macStr);
-  cJSON_AddNumberToObject(root, "rssi", WiFi.RSSI());
-  cJSON_AddStringToObject(root, "ssid", WiFi.SSID().c_str());
-  cJSON_AddNumberToObject(root, "uptime_ms", (double)millis());
-  cJSON_AddNumberToObject(root, "free_heap", (double)ESP.getFreeHeap());
-  cJSON_AddNumberToObject(root, "free_psram", (double)ESP.getFreePsram());
-  cJSON_AddNumberToObject(root, "internal_free_heap",
-                          (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  cJSON_AddNumberToObject(root, "internal_min_free_heap",
-                          (double)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  cJSON_AddNumberToObject(root, "internal_largest_free_block",
-                          (double)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-  cJSON_AddNumberToObject(root, "psram_free_heap",
-                          (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  cJSON_AddNumberToObject(root, "psram_min_free_heap",
-                          (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  cJSON_AddNumberToObject(root, "psram_largest_free_block",
-                          (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  cJSON_AddBoolToObject(root, "mic_streaming", MicStream::isRunning());
-  cJSON_AddBoolToObject(root, "mic_aec_ready", MicStream::isAecReady());
-  cJSON_AddNumberToObject(root, "mic_ws_clients", MicStream::clientCount());
-  cJSON_AddNumberToObject(root, "mic_bytes_read", (double)MicStream::bytesRead());
-  cJSON_AddNumberToObject(root, "mic_frames_sent", (double)MicStream::framesSent());
-  cJSON_AddBoolToObject(root, "wake_ready", MicStream::isWakeReady());
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
   cJSON_AddStringToObject(root, "wake_model", MicStream::wakeModel());
   cJSON_AddStringToObject(root, "wake_requested_model", MicStream::requestedWakeModel());
-  cJSON *wakeModels = cJSON_AddArrayToObject(root, "wake_supported_models");
-  if (wakeModels) {
-    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_jarvis_tts"));
-    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaomeitongxue_tts"));
-    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoyaxiaoya_tts2"));
-    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoluxiaolu_tts2"));
-    cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_hixiaoxing_tts"));
-  }
-  cJSON_AddNumberToObject(root, "wake_detections", (double)MicStream::wakeDetections());
-  cJSON_AddNumberToObject(root, "wake_last_ms", (double)MicStream::lastWakeMs());
-  cJSON_AddNumberToObject(root, "wake_event_clients", MicStream::wakeEventClientCount());
-  cJSON_AddNumberToObject(root, "wake_threshold", MicStream::wakeThreshold());
-  cJSON_AddNumberToObject(root, "wake_afe_gain", MicStream::wakeAfeGain());
-  cJSON_AddNumberToObject(root, "wake_detection_mode", MicStream::wakeDetectionMode());
-  cJSON_AddNumberToObject(root, "wake_afe_feed_samples", MicStream::afeFeedSamples());
-  cJSON_AddNumberToObject(root, "wake_afe_feed_channels", MicStream::afeFeedChannels());
-  cJSON_AddNumberToObject(root, "mic_push_task_create_result", MicStream::pushTaskCreateResult());
-  cJSON_AddNumberToObject(root, "wake_fetch_task_create_result", MicStream::fetchTaskCreateResult());
-  cJSON_AddBoolToObject(root, "wake_inline_fetch", MicStream::isInlineFetch());
-  cJSON_AddNumberToObject(root, "wake_afe_feeds", (double)MicStream::afeFeeds());
-  cJSON_AddNumberToObject(root, "wake_afe_fetch_attempts", (double)MicStream::afeFetchAttempts());
-  cJSON_AddNumberToObject(root, "wake_afe_fetches", (double)MicStream::afeFetches());
-  cJSON_AddNumberToObject(root, "wake_afe_fetch_nulls", (double)MicStream::afeFetchNulls());
-  cJSON_AddNumberToObject(root, "wake_afe_last_ret", MicStream::lastAfeRet());
-  cJSON_AddNumberToObject(root, "wake_afe_last_ms", (double)MicStream::lastAfeMs());
-  cJSON_AddNumberToObject(root, "wake_afe_last_state", MicStream::lastWakeupState());
-  cJSON_AddNumberToObject(root, "wake_afe_last_word_index", MicStream::lastWakeWordIndex());
-  cJSON_AddNumberToObject(root, "wake_afe_last_trigger_channel", MicStream::lastTriggerChannel());
-  cJSON_AddNumberToObject(root, "wake_afe_last_vad_state", MicStream::lastVadState());
-  cJSON_AddNumberToObject(root, "wake_afe_last_volume_db", MicStream::lastAfeVolumeDb());
-  cJSON_AddNumberToObject(root, "wake_afe_ring_free_pct", MicStream::lastAfeRingFreePct());
-  cJSON_AddNumberToObject(root, "mic_last_rms", (double)MicStream::lastMicRms());
-  cJSON_AddNumberToObject(root, "mic_last_peak", (double)MicStream::lastMicPeak());
-  cJSON_AddBoolToObject(root, "speaker_streaming", SpeakerStream::isRunning());
-  cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
-  addLedStatus(root);
-
+  addWakeSupportedModels(root);
   if (sensor != nullptr) {
     cJSON_AddNumberToObject(root, "framesize", sensor->status.framesize);
     cJSON_AddNumberToObject(root, "jpeg_quality", sensor->status.quality);
@@ -200,12 +357,133 @@ esp_err_t deviceStatusHandler(httpd_req_t *req) {
     cJSON_AddBoolToObject(root, "hmirror", sensor->status.hmirror);
     cJSON_AddBoolToObject(root, "vflip", sensor->status.vflip);
   }
+  return root;
+}
 
-  return sendJson(req, root);
+bool writeCompactStatusJson(char *body, size_t bodyLen) {
+  if (!body || bodyLen == 0) return false;
+
+  String hostname = NetConfig::deviceHostname();
+  String ownerId;
+  String ownerLabel;
+  String secretHash;
+  bool paired = NetConfig::loadPairing(ownerId, ownerLabel, secretHash);
+  String ip = WiFi.localIP().toString();
+  int ledMode = LedSerial::currentMode();
+
+  size_t used = 0;
+  body[0] = '\0';
+
+  bool ok = true;
+  ok = ok && appendRaw(body, bodyLen, &used, "{");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"configured\":true,\"mode\":\"work\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"firmware\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, FIRMWARE_VERSION);
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"hostname\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, hostname.c_str());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"pairing_supported\":true,\"paired\":%s",
+                           paired ? "true" : "false");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"pairing_state\":\"");
+  ok = ok && appendRaw(body, bodyLen, &used, paired ? "paired" : "unpaired");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"paired_owner_id\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, paired ? ownerId.c_str() : "");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"paired_owner_label\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, paired ? ownerLabel.c_str() : "");
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"ip\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, ip.c_str());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"mic_streaming\":%s",
+                           MicStream::isRunning() ? "true" : "false");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"wake_ready\":%s",
+                           MicStream::isWakeReady() ? "true" : "false");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"wake_model\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::wakeModel());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"wake_requested_model\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::requestedWakeModel());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"wake_supported_models\":");
+  ok = ok && appendRaw(body, bodyLen, &used, kWakeSupportedModelsJson);
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"wake_event_clients\":%d",
+                           MicStream::wakeEventClientCount());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_ready\":%s",
+                           LedSerial::isReady() ? "true" : "false");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_mode\":%d", ledMode);
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"led_mode_name\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::modeName(ledMode));
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_brightness\":%d",
+                           LedSerial::currentBrightness());
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"led_last_command\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::lastCommand());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_last_write_ms\":%.0f",
+                           (double)LedSerial::lastWriteMs());
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"led_driver\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::driverName());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_pixel_pin\":%d",
+                           LedSerial::pixelPin());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_pixel_count\":%d",
+                           LedSerial::pixelCount());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_panel_count\":%d",
+                           LedSerial::panelCount());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_output_ok\":%s}",
+                           LedSerial::outputOk() ? "true" : "false");
+  return ok;
+}
+
+esp_err_t deviceStatusHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  constexpr size_t kStatusBodyBytes = 1024;
+  char *body = static_cast<char *>(heap_caps_malloc(kStatusBodyBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!body) {
+    body = static_cast<char *>(heap_caps_malloc(kStatusBodyBytes, MALLOC_CAP_8BIT));
+  }
+  if (!body) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status oom");
+    return ESP_FAIL;
+  }
+  if (!writeCompactStatusJson(body, kStatusBodyBytes)) {
+    heap_caps_free(body);
+    Serial.println("[device_api] /device/status overflow");
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "status overflow");
+    return ESP_FAIL;
+  }
+  esp_err_t res = httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  heap_caps_free(body);
+  return res;
+}
+
+esp_err_t deviceDebugStatusHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  constexpr size_t kDebugStatusBodyBytes = 4096;
+  char *body = static_cast<char *>(heap_caps_malloc(kDebugStatusBodyBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (!body) {
+    body = static_cast<char *>(heap_caps_malloc(kDebugStatusBodyBytes, MALLOC_CAP_8BIT));
+  }
+  if (!body) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "debug status oom");
+    return ESP_FAIL;
+  }
+  if (!writeDebugStatusJson(body, kDebugStatusBodyBytes)) {
+    heap_caps_free(body);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "debug status overflow");
+    return ESP_FAIL;
+  }
+  esp_err_t res = httpd_resp_send(req, body, HTTPD_RESP_USE_STRLEN);
+  heap_caps_free(body);
+  return res;
 }
 
 esp_err_t deviceConfigGetHandler(httpd_req_t *req) {
-  return deviceStatusHandler(req);
+  setJsonHeaders(req);
+  return sendJson(req, buildConfigJson());
 }
 
 esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
@@ -588,6 +866,7 @@ bool registerHandlers(httpd_handle_t server) {
 
   const httpd_uri_t routes[] = {
       {.uri = "/device/status", .method = HTTP_GET, .handler = deviceStatusHandler, .user_ctx = NULL},
+      {.uri = "/device/debug/status", .method = HTTP_GET, .handler = deviceDebugStatusHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_GET, .handler = deviceConfigGetHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_POST, .handler = deviceConfigPostHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_GET, .handler = deviceLedGetHandler, .user_ctx = NULL},
@@ -599,6 +878,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/reboot", .method = HTTP_POST, .handler = deviceRebootHandler, .user_ctx = NULL},
       {.uri = "/device/forget-wifi", .method = HTTP_POST, .handler = deviceForgetWifiHandler, .user_ctx = NULL},
       {.uri = "/device/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/debug/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
