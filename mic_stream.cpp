@@ -699,23 +699,6 @@ bool begin() {
   return true;
 }
 
-void stop() {
-  g_pushRunning = false;
-  if (g_pushTask) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-    g_pushTask = nullptr;
-  }
-  if (g_fetchTask) {
-    vTaskDelay(pdMS_TO_TICKS(100));
-    g_fetchTask = nullptr;
-  }
-  if (g_micReady) {
-    i2sMic.end();
-    g_micReady = false;
-  }
-  destroyWakeWord();
-}
-
 bool isRunning() {
   return g_micReady && g_pushRunning;
 }

@@ -8,7 +8,6 @@
 namespace MicStream {
 
 bool begin();
-void stop();
 bool isRunning();
 bool registerWsHandler(httpd_handle_t server);
 bool isAecReady();

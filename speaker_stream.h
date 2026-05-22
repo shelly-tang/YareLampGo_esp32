@@ -6,9 +6,7 @@
 namespace SpeakerStream {
 
 bool begin();
-void stop();
 bool isRunning();
-bool startPlaybackTask();
 bool registerWsHandler(httpd_handle_t server);
 void closeClients();
 size_t readReference(int16_t *out, size_t samples);

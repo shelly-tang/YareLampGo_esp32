@@ -358,28 +358,8 @@ bool begin() {
   return true;
 }
 
-void stop() {
-  g_playRunning = false;
-  if (g_playTask) {
-    vTaskDelay(pdMS_TO_TICKS(200));
-    g_playTask = nullptr;
-  }
-  if (g_speakerReady) {
-    i2sSpeaker.end();
-    g_speakerReady = false;
-  }
-  if (g_refRing) {
-    heap_caps_free(g_refRing);
-    g_refRing = nullptr;
-  }
-}
-
 bool isRunning() {
   return g_speakerReady && g_playRunning;
-}
-
-bool startPlaybackTask() {
-  return ensurePlayTaskRunning();
 }
 
 size_t readReference(int16_t *out, size_t samples) {

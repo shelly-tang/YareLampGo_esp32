@@ -105,13 +105,6 @@ bool startServices() {
   return true;
 }
 
-bool start() {
-  if (!connectNetwork()) {
-    return false;
-  }
-  return startServices();
-}
-
 void loop() {
   static unsigned long lastCheck = 0;
   unsigned long now = millis();
@@ -129,13 +122,6 @@ void loop() {
 
 bool isActive() {
   return g_active;
-}
-
-unsigned long uptimeSeconds() {
-  if (g_startupMs == 0) {
-    return 0;
-  }
-  return (millis() - g_startupMs) / 1000UL;
 }
 
 }
