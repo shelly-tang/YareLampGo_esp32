@@ -373,6 +373,16 @@ const uint8_t kCombinedPatterns[][8][16] = {
     },
     {
         {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
+        {0,0,0,1,1,0,0,0, 0,0,0,1,1,0,0,0},
+        {0,0,1,1,1,1,0,0, 0,0,1,1,1,1,0,0},
+        {0,0,1,1,1,1,0,0, 0,0,1,1,1,1,0,0},
+        {0,0,0,1,1,0,0,0, 0,0,0,1,1,0,0,0},
+        {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
+        {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
+    },
+    {
+        {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
         {0,0,0,1,1,0,0,0, 0,0,0,1,1,0,0,0},
         {0,0,1,1,1,1,0,0, 0,0,1,1,1,1,0,0},
         {0,0,1,1,1,1,0,0, 0,0,1,1,1,1,0,0},
@@ -699,8 +709,8 @@ void renderHeart(uint32_t frame) {
 }
 
 void renderSurprised(uint32_t frame) {
-  uint32_t phase = frame % 19;
-  int patternIndex = phase < 2 ? 19 : (phase < 4 ? 20 : 21);
+  uint32_t phase = frame % 12;
+  int patternIndex = phase == 0 ? 19 : (phase == 1 ? 20 : 21);
   drawCombinedPattern(patternIndex, color(0, g_brightness, g_brightness));
 }
 
@@ -919,7 +929,9 @@ void resetFocusedAnimationLocked(uint32_t now) {
 
 void resetAnimationStateLocked(uint32_t now) {
   g_animFrame = 0;
-  g_lastFrameMs = 0;
+  // setMode/setBrightness renders frame 0 immediately, so the next step
+  // must wait a full frame interval instead of advancing on the next task tick.
+  g_lastFrameMs = now;
   g_modeStartedMs = now;
   if (g_mode == 31) {
     resetFocusedAnimationLocked(now);
