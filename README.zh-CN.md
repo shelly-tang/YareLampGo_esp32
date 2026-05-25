@@ -1,0 +1,160 @@
+# LampGo ESP32 固件烧录指南
+
+## 先复制这个：两个快捷烧录命令
+
+如果你已经安装了 Arduino IDE，或者电脑里有 `arduino-cli`，在源码目录里运行：
+
+```bash
+cd esp32_lamp
+./scripts/flash.sh --erase --monitor
+```
+
+如果你没有 Arduino，只是下载了 LampGo 发布页里的预编译固件包，解压后在固件包目录里运行：
+
+```bash
+cd lampgo-esp32-firmware
+./flash.sh --prebuilt . --erase --monitor
+```
+
+`--erase` 会清空旧 WiFi 和旧绑定。第一次烧录、换电脑、配网异常、想重新进入 `Lampgo-Setup-XXXX` 热点时建议保留它。普通升级且想保留原 WiFi 时，可以去掉 `--erase`。
+
+## 应该选哪个命令
+
+- 你拿到的是这个源码仓库，并且电脑装了 Arduino IDE：用第一个命令。
+- 你不想安装 Arduino，只想把别人编译好的固件烧进去：用第二个命令。
+- 你只是想重新配网、清空旧绑定：两个命令都可以，但要保留 `--erase`。
+
+## 烧录前准备
+
+1. 用 USB 数据线连接 ESP32。注意有些线只能充电，不能传数据。
+2. 关闭 Arduino 串口监视器、其它占用串口的软件。
+3. 如果电脑接了多个开发板，先列出串口：
+
+```bash
+./scripts/flash.sh --list-ports
+```
+
+macOS 上常见端口长这样：`/dev/cu.usbmodem2101`、`/dev/cu.usbserial-xxxx`。Linux 上常见端口是 `/dev/ttyACM0`、`/dev/ttyUSB0`。
+
+如果脚本提示有多个串口，需要指定端口：
+
+```bash
+./scripts/flash.sh --port /dev/cu.usbmodem2101 --erase --monitor
+```
+
+预编译包也一样：
+
+```bash
+./flash.sh --prebuilt . --port /dev/cu.usbmodem2101 --erase --monitor
+```
+
+## 有 Arduino 的源码烧录
+
+脚本会自动寻找：
+
+- 系统 PATH 里的 `arduino-cli`
+- macOS 上 Arduino IDE 自带的 `arduino-cli`
+- Arduino ESP32 core 自带的 `esptool`
+
+需要安装 Arduino ESP32 开发板包，目标板是：
+
+```text
+XIAO_ESP32S3 + OPI PSRAM
+```
+
+常用命令：
+
+```bash
+./scripts/flash.sh --erase --monitor
+```
+
+只编译、不烧录：
+
+```bash
+./scripts/flash.sh --build-only
+```
+
+打包一个给非 Arduino 用户使用的预编译固件包：
+
+```bash
+./scripts/flash.sh --build-only --package ./dist/lampgo-esp32-firmware
+```
+
+## 没有 Arduino 的预编译包烧录
+
+预编译包里应该包含这些文件：
+
+- `ESP32_CAMERA.ino.bootloader.bin`
+- `ESP32_CAMERA.ino.partitions.bin`
+- `boot_app0.bin`
+- `ESP32_CAMERA.ino.bin`
+- `srmodels.bin`
+- `flash.sh`
+
+如果电脑没有 `esptool`，先安装：
+
+```bash
+python3 -m pip install --user esptool
+```
+
+然后在解压后的固件包目录里烧录：
+
+```bash
+./flash.sh --prebuilt . --erase --monitor
+```
+
+这条路径不需要安装 Arduino IDE。
+
+## 烧录成功后会看到什么
+
+干净烧录后，串口日志里应该能看到类似内容：
+
+```text
+No WiFi credentials stored. Entering provisioning mode.
+[provision] WiFi not configured, SoftAP+STA mode
+[provision] SSID: Lampgo-Setup-XXXX
+```
+
+然后在电脑 WiFi 列表中连接 `Lampgo-Setup-XXXX`，回到 LampGo 网页配置家庭 WiFi。
+
+## 当前固件的通话模式
+
+这版固件支持 LampGo 前端的三种通话模式：
+
+- 稳定模式：ESP32 使用 `stable_raw`，默认不启用板载 AEC，优先保证不断连。
+- 可打断模式：ESP32 使用 `interruptible_raw`，不启用板载 AEC，靠 PC 侧文本过滤降低自回声。
+- ESP32 AEC：ESP32 使用 `aec_experiment`，会启用 ESP-SR AFE/AEC，属于实验模式，内存压力更大。
+
+如果你遇到断连、扬声器卡顿、通话不稳定，优先在 LampGo 设置里切回“稳定”模式。
+
+## 上传失败怎么办
+
+如果脚本一直连不上开发板：
+
+1. 按住 ESP32 的 `BOOT` 按钮。
+2. 点按一下 `RESET`。
+3. 松开 `RESET`。
+4. 松开 `BOOT`。
+5. 重新运行烧录命令。
+
+如果脚本找不到串口，拔插 USB 后再运行：
+
+```bash
+./scripts/flash.sh --list-ports
+```
+
+## 配网诊断
+
+如果 LampGo 网页提示 WiFi 扫描失败、probe 失败，先让电脑连接 `Lampgo-Setup-XXXX`，然后在源码目录运行：
+
+```bash
+./scripts/provision_diag.sh
+```
+
+脚本会把日志写到 `logs/` 目录。运行完后切回正常 WiFi，把日志发给开发者排查即可。
+
+如果 LampGo 后端不是默认地址：
+
+```bash
+./scripts/provision_diag.sh --lampgo-url http://127.0.0.1:8420
+```

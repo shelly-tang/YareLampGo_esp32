@@ -27,6 +27,7 @@
 #define SPK_UPSAMPLE_FACTOR (SPK_OUTPUT_SAMPLE_RATE / SPK_INPUT_SAMPLE_RATE)  // 3
 #define SPK_MAX_FRAME_BYTES 4096
 #define SPK_QUEUE_DEPTH 12
+#define SPK_PREFILL_PACKETS 3
 #define SPK_DEFAULT_VOLUME 0.7f
 // AEC reference ring keeps 16 kHz samples (same rate as mic).
 // Keep one second in PSRAM; older reference audio is not useful for AEC and
@@ -49,6 +50,10 @@ size_t g_refRead = 0;
 size_t g_refWrite = 0;
 size_t g_refCount = 0;
 float g_volume = SPK_DEFAULT_VOLUME;
+volatile uint32_t g_packetsQueued = 0;
+volatile uint32_t g_packetsDropped = 0;
+volatile uint32_t g_underruns = 0;
+volatile uint32_t g_shortWrites = 0;
 
 const char *kSpeakerPrefsNamespace = "lampgo-audio";
 const char *kSpeakerVolumeKey = "speaker_volume";
@@ -196,10 +201,20 @@ void playTaskFn(void *) {
 
   // Scratch buffer big enough for any incoming frame upsampled 3x.
   static int16_t upsampleScratch[SPK_MAX_FRAME_BYTES / 2 * SPK_UPSAMPLE_FACTOR];
+  bool buffering = true;
 
   while (g_playRunning) {
     AudioPacket pkt = {};
+    if (
+        g_speakerReady &&
+        g_clientFd >= 0 &&
+        buffering &&
+        uxQueueMessagesWaiting(g_audioQueue) < SPK_PREFILL_PACKETS) {
+      i2sSpeaker.write((uint8_t *)silence48k, sizeof(silence48k));
+      continue;
+    }
     if (xQueueReceive(g_audioQueue, &pkt, pdMS_TO_TICKS(5)) == pdTRUE) {
+      buffering = false;
       if (g_speakerReady && pkt.data && pkt.len > 0) {
         applyVolume(pkt.data, pkt.len);
         pushReference(pkt.data, pkt.len);  // 16 kHz reference for AEC
@@ -209,12 +224,21 @@ void playTaskFn(void *) {
         size_t outBytes = outSamples * sizeof(int16_t);
         size_t written = i2sSpeaker.write((uint8_t *)upsampleScratch, outBytes);
         if (written != outBytes) {
+          g_shortWrites++;
           Serial.printf("[speaker_stream] short write: %u/%u\n",
                         (unsigned)written, (unsigned)outBytes);
         }
       }
       freePacket(pkt);
     } else if (g_speakerReady) {
+      if (g_clientFd >= 0) {
+        buffering = true;
+        g_underruns++;
+        if (g_underruns == 1 || g_underruns % 50 == 0) {
+          Serial.printf("[speaker_stream] underrun count=%u queued=%u\n",
+                        (unsigned)g_underruns, (unsigned)uxQueueMessagesWaiting(g_audioQueue));
+        }
+      }
       // I2S write is blocking on the DMA buffer, so this naturally paces to
       // ~16 ms per iteration and won't spin the CPU.
       i2sSpeaker.write((uint8_t *)silence48k, sizeof(silence48k));
@@ -252,11 +276,17 @@ void enqueueAudio(const uint8_t *payload, size_t len) {
     AudioPacket dropped = {};
     if (xQueueReceive(g_audioQueue, &dropped, 0) == pdTRUE) {
       freePacket(dropped);
+      g_packetsDropped++;
     }
     if (xQueueSend(g_audioQueue, &pkt, 0) != pdTRUE) {
       freePacket(pkt);
+      g_packetsDropped++;
       Serial.println("[speaker_stream] queue full, dropped packet");
+    } else {
+      g_packetsQueued++;
     }
+  } else {
+    g_packetsQueued++;
   }
 }
 
@@ -398,6 +428,27 @@ void setVolume(float volume) {
 
 float getVolume() {
   return g_volume;
+}
+
+uint32_t queuedPackets() {
+  if (!g_audioQueue) return 0;
+  return (uint32_t)uxQueueMessagesWaiting(g_audioQueue);
+}
+
+uint32_t packetsQueued() {
+  return g_packetsQueued;
+}
+
+uint32_t packetsDropped() {
+  return g_packetsDropped;
+}
+
+uint32_t underruns() {
+  return g_underruns;
+}
+
+uint32_t shortWrites() {
+  return g_shortWrites;
 }
 
 bool registerWsHandler(httpd_handle_t server) {

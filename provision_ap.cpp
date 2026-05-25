@@ -34,7 +34,7 @@ void handleStatus() {
 
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "configured", false);
-  cJSON_AddStringToObject(root, "mode", "ap");
+  cJSON_AddStringToObject(root, "mode", "ap_sta");
   cJSON_AddStringToObject(root, "mac", macStr);
   cJSON_AddStringToObject(root, "hostname", NetConfig::deviceHostname().c_str());
   cJSON_AddStringToObject(root, "ap_ssid", NetConfig::apSsid().c_str());
@@ -51,8 +51,11 @@ void handleScan() {
   addCors();
 
   int16_t n = WiFi.scanNetworks(false, true);
+  Serial.printf("[provision] scan result=%d\n", n);
   cJSON *root = cJSON_CreateObject();
   cJSON *arr = cJSON_AddArrayToObject(root, "networks");
+  cJSON_AddNumberToObject(root, "scan_result", n);
+  cJSON_AddBoolToObject(root, "scan_ok", n >= 0);
 
   if (n > 0) {
     for (int i = 0; i < n && i < 30; i++) {
@@ -64,6 +67,8 @@ void handleScan() {
       cJSON_AddBoolToObject(item, "encrypt", WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
       cJSON_AddItemToArray(arr, item);
     }
+  } else if (n < 0) {
+    cJSON_AddStringToObject(root, "error", "scan_failed");
   }
   WiFi.scanDelete();
 
@@ -142,7 +147,7 @@ void start() {
   delay(200);
   WiFi.mode(WIFI_OFF);
   delay(500);
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
   const String ssid = NetConfig::apSsid();
   bool ok = WiFi.softAP(ssid.c_str(), NetConfig::apPassword());
@@ -151,7 +156,7 @@ void start() {
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_OFF);
     delay(800);
-    WiFi.mode(WIFI_AP);
+    WiFi.mode(WIFI_AP_STA);
     delay(200);
     ok = WiFi.softAP(ssid.c_str(), NetConfig::apPassword());
   }
@@ -159,7 +164,7 @@ void start() {
 
   Serial.println();
   Serial.println("============================================");
-  Serial.println("[provision] WiFi not configured, SoftAP mode");
+  Serial.println("[provision] WiFi not configured, SoftAP+STA mode");
   Serial.printf("[provision] SSID: %s\n", ssid.c_str());
   Serial.printf("[provision] Password: %s\n", NetConfig::apPassword());
   Serial.printf("[provision] IP: %s\n", ip.toString().c_str());

@@ -261,10 +261,14 @@ bool writeDebugStatusJson(char *body, size_t bodyLen) {
                            (double)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
                            (double)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   ok = ok && appendFormat(body, bodyLen, &used,
-                           ",\"mic_streaming\":%s,\"mic_aec_ready\":%s,\"mic_ws_clients\":%d",
+                           ",\"mic_streaming\":%s,\"mic_aec_ready\":%s,\"mic_aec_enabled\":%s,\"mic_ws_clients\":%d",
                            MicStream::isRunning() ? "true" : "false",
                            MicStream::isAecReady() ? "true" : "false",
+                           MicStream::isAecEnabled() ? "true" : "false",
                            (int)MicStream::clientCount());
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"audio_profile\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::audioProfile());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
   ok = ok && appendFormat(body, bodyLen, &used,
                            ",\"mic_bytes_read\":%.0f,\"mic_frames_sent\":%.0f",
                            (double)MicStream::bytesRead(), (double)MicStream::framesSent());
@@ -310,6 +314,13 @@ bool writeDebugStatusJson(char *body, size_t bodyLen) {
                            ",\"speaker_streaming\":%s,\"speaker_volume\":%.3f",
                            SpeakerStream::isRunning() ? "true" : "false",
                            (double)SpeakerStream::getVolume());
+  ok = ok && appendFormat(body, bodyLen, &used,
+                           ",\"speaker_queue\":%.0f,\"speaker_packets_queued\":%.0f,\"speaker_packets_dropped\":%.0f,\"speaker_underruns\":%.0f,\"speaker_short_writes\":%.0f",
+                           (double)SpeakerStream::queuedPackets(),
+                           (double)SpeakerStream::packetsQueued(),
+                           (double)SpeakerStream::packetsDropped(),
+                           (double)SpeakerStream::underruns(),
+                           (double)SpeakerStream::shortWrites());
   ok = ok && appendFormat(body, bodyLen, &used, ",\"led_ready\":%s,\"led_mode\":%d",
                            LedSerial::isReady() ? "true" : "false", ledMode);
   ok = ok && appendRaw(body, bodyLen, &used, ",\"led_mode_name\":\"");
@@ -345,6 +356,9 @@ cJSON *buildConfigJson() {
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "ok", true);
   cJSON_AddNumberToObject(root, "speaker_volume", SpeakerStream::getVolume());
+  cJSON_AddStringToObject(root, "audio_profile", MicStream::audioProfile());
+  cJSON_AddBoolToObject(root, "mic_aec_enabled", MicStream::isAecEnabled());
+  cJSON_AddBoolToObject(root, "mic_aec_ready", MicStream::isAecReady());
   cJSON_AddStringToObject(root, "wake_model", MicStream::wakeModel());
   cJSON_AddStringToObject(root, "wake_requested_model", MicStream::requestedWakeModel());
   addWakeSupportedModels(root);
@@ -399,6 +413,12 @@ bool writeCompactStatusJson(char *body, size_t bodyLen) {
   ok = ok && appendRaw(body, bodyLen, &used, "\"");
   ok = ok && appendFormat(body, bodyLen, &used, ",\"mic_streaming\":%s",
                            MicStream::isRunning() ? "true" : "false");
+  ok = ok && appendRaw(body, bodyLen, &used, ",\"audio_profile\":\"");
+  ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::audioProfile());
+  ok = ok && appendRaw(body, bodyLen, &used, "\"");
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"mic_aec_enabled\":%s,\"mic_aec_ready\":%s",
+                           MicStream::isAecEnabled() ? "true" : "false",
+                           MicStream::isAecReady() ? "true" : "false");
   ok = ok && appendFormat(body, bodyLen, &used, ",\"wake_ready\":%s",
                            MicStream::isWakeReady() ? "true" : "false");
   ok = ok && appendRaw(body, bodyLen, &used, ",\"wake_model\":\"");
@@ -440,7 +460,7 @@ bool writeCompactStatusJson(char *body, size_t bodyLen) {
 
 esp_err_t deviceStatusHandler(httpd_req_t *req) {
   setJsonHeaders(req);
-  constexpr size_t kStatusBodyBytes = 1024;
+  constexpr size_t kStatusBodyBytes = 1280;
   char *body = static_cast<char *>(heap_caps_malloc(kStatusBodyBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!body) {
     body = static_cast<char *>(heap_caps_malloc(kStatusBodyBytes, MALLOC_CAP_8BIT));
@@ -570,6 +590,16 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
     if (v < 0.0) v = 0.0;
     if (v > 1.0) v = 1.0;
     SpeakerStream::setVolume((float)v);
+    applied++;
+  }
+
+  item = cJSON_GetObjectItemCaseSensitive(doc, "audio_profile");
+  if (cJSON_IsString(item) && item->valuestring) {
+    if (!MicStream::setAudioProfile(item->valuestring)) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported audio_profile");
+      return ESP_FAIL;
+    }
     applied++;
   }
 

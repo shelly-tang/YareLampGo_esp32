@@ -127,6 +127,11 @@ uint32_t g_ownerLeaseUntilMs = 0;
 
 const char *kWakePrefsNamespace = "lampgo-audio";
 const char *kWakeModelKey = "wake_model";
+const char *kAudioProfileKey = "audio_profile";
+const char *AUDIO_PROFILE_STABLE_RAW = "stable_raw";
+const char *AUDIO_PROFILE_INTERRUPTIBLE_RAW = "interruptible_raw";
+const char *AUDIO_PROFILE_AEC_EXPERIMENT = "aec_experiment";
+char g_audioProfile[32] = "stable_raw";
 
 const char *kSupportedWakeModels[] = {
     "wn9_jarvis_tts",
@@ -144,15 +149,32 @@ bool isSupportedWakeModel(const char *modelName) {
   return false;
 }
 
+bool isSupportedAudioProfile(const char *profile) {
+  return profile && (
+      strcmp(profile, AUDIO_PROFILE_STABLE_RAW) == 0 ||
+      strcmp(profile, AUDIO_PROFILE_INTERRUPTIBLE_RAW) == 0 ||
+      strcmp(profile, AUDIO_PROFILE_AEC_EXPERIMENT) == 0);
+}
+
+bool audioProfileUsesAfe() {
+  return strcmp(g_audioProfile, AUDIO_PROFILE_AEC_EXPERIMENT) == 0;
+}
+
 void loadWakeModelPreference() {
   Preferences prefs;
   if (!prefs.begin(kWakePrefsNamespace, true)) return;
   String value = prefs.getString(kWakeModelKey, DEFAULT_WAKE_MODEL);
+  String profile = prefs.getString(kAudioProfileKey, AUDIO_PROFILE_STABLE_RAW);
   prefs.end();
   if (isSupportedWakeModel(value.c_str())) {
     strlcpy(g_requestedWakeModelName, value.c_str(), sizeof(g_requestedWakeModelName));
   } else {
     strlcpy(g_requestedWakeModelName, DEFAULT_WAKE_MODEL, sizeof(g_requestedWakeModelName));
+  }
+  if (isSupportedAudioProfile(profile.c_str())) {
+    strlcpy(g_audioProfile, profile.c_str(), sizeof(g_audioProfile));
+  } else {
+    strlcpy(g_audioProfile, AUDIO_PROFILE_STABLE_RAW, sizeof(g_audioProfile));
   }
 }
 
@@ -160,6 +182,14 @@ bool saveWakeModelPreference(const char *modelName) {
   Preferences prefs;
   if (!prefs.begin(kWakePrefsNamespace, false)) return false;
   size_t written = prefs.putString(kWakeModelKey, modelName);
+  prefs.end();
+  return written > 0;
+}
+
+bool saveAudioProfilePreference(const char *profile) {
+  Preferences prefs;
+  if (!prefs.begin(kWakePrefsNamespace, false)) return false;
+  size_t written = prefs.putString(kAudioProfileKey, profile);
   prefs.end();
   return written > 0;
 }
@@ -514,6 +544,11 @@ void destroyWakeWord() {
 }
 
 bool initWakeWord() {
+  if (!audioProfileUsesAfe()) {
+    Serial.printf("[mic_stream] AFE/WakeNet disabled by audio_profile=%s (raw mic path)\n",
+                  g_audioProfile);
+    return false;
+  }
 #if !LAMPGO_HAS_WAKE_WORD
   Serial.println("[mic_stream] WakeNet disabled: ESP-SR model support is not enabled in this build");
   return false;
@@ -840,8 +875,8 @@ bool begin() {
 
   g_micReady = true;
   initWakeWord();
-  Serial.printf("[mic_stream] I2S PDM ready: %d Hz, mono, 16-bit\n",
-                MIC_SAMPLE_RATE);
+  Serial.printf("[mic_stream] I2S PDM ready: %d Hz, mono, 16-bit, audio_profile=%s\n",
+                MIC_SAMPLE_RATE, g_audioProfile);
   return true;
 }
 
@@ -851,6 +886,40 @@ bool isRunning() {
 
 bool isAecReady() {
   return g_afeReady;
+}
+
+bool isAecEnabled() {
+  return audioProfileUsesAfe();
+}
+
+const char *audioProfile() {
+  return g_audioProfile;
+}
+
+bool setAudioProfile(const char *profile) {
+  if (!isSupportedAudioProfile(profile)) {
+    Serial.printf("[mic_stream] rejected unsupported audio profile: %s\n",
+                  profile ? profile : "(null)");
+    return false;
+  }
+  if (strcmp(g_audioProfile, profile) == 0) {
+    return true;
+  }
+
+  Serial.printf("[mic_stream] switching audio_profile %s -> %s\n", g_audioProfile, profile);
+  strlcpy(g_audioProfile, profile, sizeof(g_audioProfile));
+  saveAudioProfilePreference(g_audioProfile);
+
+  if (!g_micReady) {
+    return true;
+  }
+  if (!audioProfileUsesAfe()) {
+    destroyWakeWord();
+    SpeakerStream::clearReference();
+    return true;
+  }
+  destroyWakeWord();
+  return initWakeWord();
 }
 
 int clientCount() {
@@ -957,6 +1026,13 @@ bool setWakeModel(const char *modelName) {
   saveWakeModelPreference(g_requestedWakeModelName);
 
   if (!g_micReady) {
+    return true;
+  }
+
+  if (!audioProfileUsesAfe()) {
+    Serial.printf("[mic_stream] stored WakeNet model %s; AFE remains disabled by audio_profile=%s\n",
+                  g_requestedWakeModelName, g_audioProfile);
+    destroyWakeWord();
     return true;
   }
 
