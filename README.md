@@ -97,6 +97,14 @@ To create a prebuilt package for users who do not have Arduino:
 
 Upload the generated directory or zip it for a GitHub release. The package includes a copy of `flash.sh`, so users without Arduino can flash from inside the unzipped package.
 
+## Wake Word Model
+
+The firmware advertises and accepts a single ESP-SR WakeNet model for LampGo hot switching:
+
+- `Hi,小星` → `wn9_hixiaoxing_tts`
+
+When LampGo saves a wake word, it pushes the model to `/device/config` with `audio_profile=wake_only` (or `aec_experiment` for the experimental AEC call mode), so the ESP32 restarts WakeNet without rebooting the board.
+
 ## Upload Troubleshooting
 
 If upload cannot connect:

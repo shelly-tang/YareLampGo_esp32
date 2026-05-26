@@ -15,10 +15,6 @@
 namespace {
 
 const char *FIRMWARE_VERSION = "lampgo-cam 0.3.2";
-const char *const kWakeSupportedModelsJson =
-    "[\"wn9_jarvis_tts\",\"wn9_xiaomeitongxue_tts\","
-    "\"wn9_xiaoyaxiaoya_tts2\",\"wn9_xiaoluxiaolu_tts2\","
-    "\"wn9_hixiaoxing_tts\"]";
 
 bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
   if (!dst || !used || !src || *used >= dstLen) return false;
@@ -184,13 +180,21 @@ void addLedSupportedModes(cJSON *root) {
 }
 
 void addWakeSupportedModels(cJSON *root) {
-  cJSON *wakeModels = cJSON_AddArrayToObject(root, "wake_supported_models");
-  if (!wakeModels) return;
-  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_jarvis_tts"));
-  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaomeitongxue_tts"));
-  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoyaxiaoya_tts2"));
-  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_xiaoluxiaolu_tts2"));
-  cJSON_AddItemToArray(wakeModels, cJSON_CreateString("wn9_hixiaoxing_tts"));
+  char modelsJson[512] = "[]";
+  MicStream::copyWakeSupportedModelsJson(modelsJson, sizeof(modelsJson));
+  cJSON *wakeModels = cJSON_Parse(modelsJson);
+  if (wakeModels && cJSON_IsArray(wakeModels)) {
+    cJSON_AddItemToObject(root, "wake_supported_models", wakeModels);
+    return;
+  }
+  if (wakeModels) cJSON_Delete(wakeModels);
+  cJSON_AddArrayToObject(root, "wake_supported_models");
+}
+
+bool appendWakeSupportedModelsJson(char *body, size_t bodyLen, size_t *used) {
+  char modelsJson[512] = "[]";
+  MicStream::copyWakeSupportedModelsJson(modelsJson, sizeof(modelsJson));
+  return appendRaw(body, bodyLen, used, modelsJson);
 }
 
 bool writeDebugStatusJson(char *body, size_t bodyLen) {
@@ -279,7 +283,7 @@ bool writeDebugStatusJson(char *body, size_t bodyLen) {
   ok = ok && appendRaw(body, bodyLen, &used, "\",\"wake_requested_model\":\"");
   ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::requestedWakeModel());
   ok = ok && appendRaw(body, bodyLen, &used, "\",\"wake_supported_models\":");
-  ok = ok && appendRaw(body, bodyLen, &used, kWakeSupportedModelsJson);
+  ok = ok && appendWakeSupportedModelsJson(body, bodyLen, &used);
   ok = ok && appendFormat(body, bodyLen, &used,
                            ",\"wake_detections\":%.0f,\"wake_last_ms\":%.0f,\"wake_event_clients\":%d",
                            (double)MicStream::wakeDetections(), (double)MicStream::lastWakeMs(),
@@ -428,7 +432,7 @@ bool writeCompactStatusJson(char *body, size_t bodyLen) {
   ok = ok && appendJsonEscaped(body, bodyLen, &used, MicStream::requestedWakeModel());
   ok = ok && appendRaw(body, bodyLen, &used, "\"");
   ok = ok && appendRaw(body, bodyLen, &used, ",\"wake_supported_models\":");
-  ok = ok && appendRaw(body, bodyLen, &used, kWakeSupportedModelsJson);
+  ok = ok && appendWakeSupportedModelsJson(body, bodyLen, &used);
   ok = ok && appendFormat(body, bodyLen, &used, ",\"wake_event_clients\":%d",
                            MicStream::wakeEventClientCount());
   ok = ok && appendFormat(body, bodyLen, &used, ",\"led_ready\":%s",
@@ -593,16 +597,6 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
     applied++;
   }
 
-  item = cJSON_GetObjectItemCaseSensitive(doc, "audio_profile");
-  if (cJSON_IsString(item) && item->valuestring) {
-    if (!MicStream::setAudioProfile(item->valuestring)) {
-      cJSON_Delete(doc);
-      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported audio_profile");
-      return ESP_FAIL;
-    }
-    applied++;
-  }
-
   item = cJSON_GetObjectItemCaseSensitive(doc, "wake_model");
   if (cJSON_IsString(item) && item->valuestring) {
     if (!MicStream::setWakeModel(item->valuestring)) {
@@ -613,10 +607,24 @@ esp_err_t deviceConfigPostHandler(httpd_req_t *req) {
     applied++;
   }
 
+  item = cJSON_GetObjectItemCaseSensitive(doc, "audio_profile");
+  if (cJSON_IsString(item) && item->valuestring) {
+    if (!MicStream::setAudioProfile(item->valuestring)) {
+      cJSON_Delete(doc);
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unsupported audio_profile");
+      return ESP_FAIL;
+    }
+    applied++;
+  }
+
   cJSON_Delete(doc);
 
-  char reply[64];
-  snprintf(reply, sizeof(reply), "{\"ok\":true,\"applied\":%d}", applied);
+  char reply[192];
+  snprintf(reply, sizeof(reply),
+           "{\"ok\":true,\"applied\":%d,\"audio_profile\":\"%s\","
+           "\"wake_model\":\"%s\",\"wake_ready\":%s}",
+           applied, MicStream::audioProfile(), MicStream::wakeModel(),
+           MicStream::isWakeReady() ? "true" : "false");
   return httpd_resp_sendstr(req, reply);
 }
 

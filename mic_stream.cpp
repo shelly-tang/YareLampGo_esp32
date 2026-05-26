@@ -49,9 +49,10 @@
 #define WAKE_AFE_LINEAR_GAIN 2.0f
 #define WAKE_DET_MODE DET_MODE_90
 #define MIN_INTERNAL_HEAP_AFTER_AFE 16384
-#define AFE_INPUT_FORMAT  "MR"
+#define AFE_INPUT_FORMAT_WAKE_ONLY "M"
+#define AFE_INPUT_FORMAT_AEC       "MR"
 #define AFE_FILTER_LENGTH 4
-#define DEFAULT_WAKE_MODEL "wn9_jarvis_tts"
+#define DEFAULT_WAKE_MODEL "wn9_hixiaoxing_tts"
 #define WS_SEND_STALE_MS 1500
 
 namespace {
@@ -130,14 +131,11 @@ const char *kWakeModelKey = "wake_model";
 const char *kAudioProfileKey = "audio_profile";
 const char *AUDIO_PROFILE_STABLE_RAW = "stable_raw";
 const char *AUDIO_PROFILE_INTERRUPTIBLE_RAW = "interruptible_raw";
+const char *AUDIO_PROFILE_WAKE_ONLY = "wake_only";
 const char *AUDIO_PROFILE_AEC_EXPERIMENT = "aec_experiment";
 char g_audioProfile[32] = "stable_raw";
 
 const char *kSupportedWakeModels[] = {
-    "wn9_jarvis_tts",
-    "wn9_xiaomeitongxue_tts",
-    "wn9_xiaoyaxiaoya_tts2",
-    "wn9_xiaoluxiaolu_tts2",
     "wn9_hixiaoxing_tts",
 };
 
@@ -149,14 +147,77 @@ bool isSupportedWakeModel(const char *modelName) {
   return false;
 }
 
+bool appendWakeModelName(char *dst, size_t dstLen, size_t *used, const char *modelName) {
+  if (!dst || !used || !modelName || *used >= dstLen) return false;
+  if (*used + 3 >= dstLen) return false;
+  dst[(*used)++] = '"';
+  for (const char *p = modelName; *p; p++) {
+    if (*p == '"' || *p == '\\') {
+      if (*used + 2 >= dstLen) return false;
+      dst[(*used)++] = '\\';
+      dst[(*used)++] = *p;
+    } else {
+      if (*used + 1 >= dstLen) return false;
+      dst[(*used)++] = *p;
+    }
+  }
+  if (*used + 1 >= dstLen) return false;
+  dst[(*used)++] = '"';
+  dst[*used] = '\0';
+  return true;
+}
+
+#if LAMPGO_HAS_WAKE_WORD
+char *firstAvailableSupportedWakeModel(srmodel_list_t *models) {
+  if (!models || !models->model_name) return nullptr;
+  for (const char *supported : kSupportedWakeModels) {
+    for (int i = 0; i < models->num; i++) {
+      char *name = models->model_name[i];
+      if (name && strcmp(name, supported) == 0) {
+        return name;
+      }
+    }
+  }
+  return nullptr;
+}
+
+size_t appendWakeModelsFromList(char *dst, size_t dstLen, size_t *used, srmodel_list_t *models) {
+  if (!dst || !used || !models || !models->model_name) return 0;
+  size_t added = 0;
+  for (int i = 0; i < models->num; i++) {
+    const char *name = models->model_name[i];
+    if (!name || strncmp(name, ESP_WN_PREFIX, strlen(ESP_WN_PREFIX)) != 0) {
+      continue;
+    }
+    if (!isSupportedWakeModel(name)) {
+      continue;
+    }
+    if (added > 0) {
+      if (*used + 1 >= dstLen) return added;
+      dst[(*used)++] = ',';
+      dst[*used] = '\0';
+    }
+    if (!appendWakeModelName(dst, dstLen, used, name)) return added;
+    added++;
+  }
+  return added;
+}
+#endif
+
 bool isSupportedAudioProfile(const char *profile) {
   return profile && (
       strcmp(profile, AUDIO_PROFILE_STABLE_RAW) == 0 ||
       strcmp(profile, AUDIO_PROFILE_INTERRUPTIBLE_RAW) == 0 ||
+      strcmp(profile, AUDIO_PROFILE_WAKE_ONLY) == 0 ||
       strcmp(profile, AUDIO_PROFILE_AEC_EXPERIMENT) == 0);
 }
 
 bool audioProfileUsesAfe() {
+  return strcmp(g_audioProfile, AUDIO_PROFILE_WAKE_ONLY) == 0 ||
+         strcmp(g_audioProfile, AUDIO_PROFILE_AEC_EXPERIMENT) == 0;
+}
+
+bool audioProfileUsesAec() {
   return strcmp(g_audioProfile, AUDIO_PROFILE_AEC_EXPERIMENT) == 0;
 }
 
@@ -569,24 +630,31 @@ bool initWakeWord() {
       esp_srmodel_exists(g_wakeModels, g_requestedWakeModelName) >= 0) {
     modelName = g_requestedWakeModelName;
   } else if (g_requestedWakeModelName[0]) {
-    Serial.printf("[mic_stream] WakeNet init FAILED: requested model not found: %s\n",
-                  g_requestedWakeModelName);
-    destroyWakeWord();
-    return false;
+    modelName = firstAvailableSupportedWakeModel(g_wakeModels);
+    if (modelName) {
+      Serial.printf("[mic_stream] WakeNet requested model not found: %s; using available model: %s\n",
+                    g_requestedWakeModelName, modelName);
+    }
   }
   if (!modelName) {
-    Serial.println("[mic_stream] WakeNet init FAILED: no requested WakeNet model");
+    modelName = firstAvailableSupportedWakeModel(g_wakeModels);
+  }
+  if (!modelName) {
+    Serial.println("[mic_stream] WakeNet init FAILED: none of the supported WakeNet models are available");
     destroyWakeWord();
     return false;
   }
 
-  g_afeConfig = afe_config_init(AFE_INPUT_FORMAT, g_wakeModels, AFE_TYPE_VC, AFE_MODE_LOW_COST);
+  const bool useAec = audioProfileUsesAec();
+  const char *inputFormat = useAec ? AFE_INPUT_FORMAT_AEC : AFE_INPUT_FORMAT_WAKE_ONLY;
+  afe_type_t afeType = useAec ? AFE_TYPE_VC : AFE_TYPE_SR;
+  g_afeConfig = afe_config_init(inputFormat, g_wakeModels, afeType, AFE_MODE_LOW_COST);
   if (!g_afeConfig) {
     Serial.println("[mic_stream] AFE WakeNet init FAILED: config allocation");
     destroyWakeWord();
     return false;
   }
-  g_afeConfig->aec_init = true;
+  g_afeConfig->aec_init = useAec;
   g_afeConfig->aec_filter_length = AFE_FILTER_LENGTH;
   g_afeConfig->se_init = false;
   g_afeConfig->ns_init = false;
@@ -629,13 +697,15 @@ bool initWakeWord() {
 
   g_afeInput = (int16_t *)heap_caps_aligned_calloc(
       16, g_afeFeedSamples * g_afeFeedChannels, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  g_refScratch = (int16_t *)heap_caps_aligned_calloc(
-      16, CHUNK_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!g_refScratch) {
+  if (g_afeFeedChannels > 1) {
     g_refScratch = (int16_t *)heap_caps_aligned_calloc(
-        16, CHUNK_SAMPLES, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        16, CHUNK_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!g_refScratch) {
+      g_refScratch = (int16_t *)heap_caps_aligned_calloc(
+          16, CHUNK_SAMPLES, sizeof(int16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
   }
-  if (!g_afeInput || !g_refScratch) {
+  if (!g_afeInput || (g_afeFeedChannels > 1 && !g_refScratch)) {
     Serial.println("[mic_stream] AFE buffer allocation FAILED");
     destroyWakeWord();
     return false;
@@ -645,10 +715,13 @@ bool initWakeWord() {
   g_afeFillSamples = 0;
   g_afeReady = true;
   g_wakeReady = true;
-  SpeakerStream::clearReference();
-  Serial.printf("[mic_stream] ESP-SR AFE WakeNet ready: model=%s feed=%d samples channels=%d threshold=%.2f gain=%.1f mode=%d input=%s\n",
+  if (useAec) {
+    SpeakerStream::clearReference();
+  }
+  Serial.printf("[mic_stream] ESP-SR AFE WakeNet ready: model=%s feed=%d samples channels=%d threshold=%.2f gain=%.1f mode=%d input=%s afe_type=%d aec=%s profile=%s\n",
                 g_wakeModelName, g_afeFeedSamples, g_afeFeedChannels,
-                WAKE_DETECTION_THRESHOLD, WAKE_AFE_LINEAR_GAIN, (int)WAKE_DET_MODE, AFE_INPUT_FORMAT);
+                WAKE_DETECTION_THRESHOLD, WAKE_AFE_LINEAR_GAIN, (int)WAKE_DET_MODE,
+                inputFormat, (int)afeType, useAec ? "on" : "off", g_audioProfile);
   if (g_afeHandle->print_pipeline) {
     g_afeHandle->print_pipeline(g_afeData);
   }
@@ -710,12 +783,18 @@ void processInputAudio(const uint8_t *payload, size_t len) {
   g_lastMicPeak = peak;
   g_lastMicRms = sampleCount > 0 ? (uint32_t)sqrt((double)sumSq / (double)sampleCount) : 0;
 
-  if (!g_afeReady || !g_afeHandle || !g_afeData || !g_afeInput || !g_refScratch) {
+  if (!g_afeReady || !g_afeHandle || !g_afeData || !g_afeInput) {
     sendAudioFrame(payload, sampleCount * sizeof(int16_t));
     return;
   }
 
-  SpeakerStream::readReference(g_refScratch, sampleCount);
+  if (g_afeFeedChannels > 1) {
+    if (!g_refScratch) {
+      sendAudioFrame(payload, sampleCount * sizeof(int16_t));
+      return;
+    }
+    SpeakerStream::readReference(g_refScratch, sampleCount);
+  }
 
   for (size_t i = 0; i < sampleCount; i++) {
     size_t idx = g_afeFillSamples * g_afeFeedChannels;
@@ -885,11 +964,11 @@ bool isRunning() {
 }
 
 bool isAecReady() {
-  return g_afeReady;
+  return g_afeReady && audioProfileUsesAec();
 }
 
 bool isAecEnabled() {
-  return audioProfileUsesAfe();
+  return audioProfileUsesAec();
 }
 
 const char *audioProfile() {
@@ -1007,6 +1086,32 @@ const char *wakeModel() {
 
 const char *requestedWakeModel() {
   return g_requestedWakeModelName;
+}
+
+size_t copyWakeSupportedModelsJson(char *dst, size_t dstLen) {
+  if (!dst || dstLen < 3) return 0;
+  size_t used = 0;
+  dst[used++] = '[';
+  dst[used] = '\0';
+
+#if LAMPGO_HAS_WAKE_WORD
+  size_t added = appendWakeModelsFromList(dst, dstLen, &used, g_wakeModels);
+  if (added == 0) {
+    srmodel_list_t *models = esp_srmodel_init("model");
+    added = appendWakeModelsFromList(dst, dstLen, &used, models);
+    if (models) {
+      esp_srmodel_deinit(models);
+    }
+  }
+#endif
+
+  if (used + 1 >= dstLen) {
+    dst[0] = '[';
+    used = 1;
+  }
+  dst[used++] = ']';
+  dst[used] = '\0';
+  return used;
 }
 
 bool setWakeModel(const char *modelName) {

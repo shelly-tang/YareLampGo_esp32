@@ -119,13 +119,14 @@ No WiFi credentials stored. Entering provisioning mode.
 
 ## 当前固件的通话模式
 
-这版固件支持 LampGo 前端的三种通话模式：
+这版固件支持 LampGo 前端的三种通话模式，并额外支持唤醒专用的 `wake_only` profile：
 
-- 稳定模式：ESP32 使用 `stable_raw`，默认不启用板载 AEC，优先保证不断连。
-- 可打断模式：ESP32 使用 `interruptible_raw`，不启用板载 AEC，靠 PC 侧文本过滤降低自回声。
+- 稳定模式：ESP32 使用 `stable_raw`；如果配置了唤醒词，LampGo 会自动切到 `wake_only`，只启用 WakeNet，不启用板载 AEC。
+- 可打断模式：ESP32 使用 `interruptible_raw`；如果配置了唤醒词，同样会自动切到 `wake_only`，靠 PC 侧文本过滤降低自回声。
+- Wake only：ESP32 使用 `wake_only`，启用 ESP-SR WakeNet 单麦唤醒，关闭 AEC，内存压力低于 `aec_experiment`。固件只支持 `Hi,小星`（`wn9_hixiaoxing_tts`）；如果模型分区未烧录这个模型，唤醒监听会保持不可用。
 - ESP32 AEC：ESP32 使用 `aec_experiment`，会启用 ESP-SR AFE/AEC，属于实验模式，内存压力更大。
 
-如果你遇到断连、扬声器卡顿、通话不稳定，优先在 LampGo 设置里切回“稳定”模式。
+如果你遇到断连、扬声器卡顿、通话不稳定，优先在 LampGo 设置里切回“稳定”模式；需要唤醒词时使用 `wake_only`，不要直接上 `aec_experiment`。
 
 ## 上传失败怎么办
 

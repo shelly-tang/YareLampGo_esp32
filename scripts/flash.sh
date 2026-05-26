@@ -9,6 +9,7 @@ PARTITION_NAME="${PARTITION_NAME:-lampgo_sr_8mb}"
 BUILD_PATH="${BUILD_PATH:-/private/tmp/lampgo_esp32_camera_build}"
 MODEL_OFFSET="${MODEL_OFFSET:-0x3F0000}"
 MODEL_SIZE="${MODEL_SIZE:-0x400000}"
+MODEL_BIN="${MODEL_BIN:-}"
 BAUD="${ESP32_BAUD:-921600}"
 PORT="${ESP32_PORT:-}"
 
@@ -45,6 +46,7 @@ Options:
   --prebuilt DIR     Flash an already-built firmware package.
                      This path does not need Arduino, only esptool.
   --package DIR      Copy build outputs into a release-friendly directory.
+  --model-bin FILE   Use a custom ESP-SR srmodels.bin for the model partition.
   --list-ports       Print likely serial ports and exit.
   -h, --help         Show this help.
 
@@ -55,6 +57,7 @@ Environment:
                      Arduino IDE installs.
   ESPTOOL            Path to esptool/esptool.py. Auto-detected from Arduino
                      ESP32 core, PATH, or python -m esptool.
+  MODEL_BIN          Same as --model-bin.
 EOF
 }
 
@@ -101,6 +104,11 @@ while [ "$#" -gt 0 ]; do
     --package)
       [ "$#" -ge 2 ] || die "--package needs a directory"
       PACKAGE_DIR="$2"
+      shift 2
+      ;;
+    --model-bin)
+      [ "$#" -ge 2 ] || die "--model-bin needs a file"
+      MODEL_BIN="$2"
       shift 2
       ;;
     --list-ports)
@@ -223,6 +231,7 @@ build_from_source() {
     "$TEMP_SKETCH_DIR"
   [ -f "$BUILD_PATH/$SKETCH_NAME.ino.bin" ] || die "app binary missing after compile"
   [ -f "$BUILD_PATH/srmodels.bin" ] || die "WakeNet model binary missing after compile: $BUILD_PATH/srmodels.bin"
+  use_custom_model_bin
 }
 
 find_boot_app0() {
@@ -287,6 +296,16 @@ require_file() {
   [ -f "$1" ] || die "missing file: $1"
 }
 
+use_custom_model_bin() {
+  [ -n "$MODEL_BIN" ] || return 0
+  require_file "$MODEL_BIN"
+  local size
+  size="$(wc -c <"$MODEL_BIN" | tr -d '[:space:]')"
+  [ "$size" -le "$((MODEL_SIZE))" ] || die "model binary is too large: ${size} bytes > $MODEL_SIZE"
+  log "Using custom WakeNet model binary: $MODEL_BIN ($size bytes)"
+  cp "$MODEL_BIN" "$BUILD_PATH/srmodels.bin"
+}
+
 flash_prebuilt() {
   local dir="$1"
   require_file "$dir/$SKETCH_NAME.ino.bootloader.bin"
@@ -294,6 +313,15 @@ flash_prebuilt() {
   require_file "$dir/boot_app0.bin"
   require_file "$dir/$SKETCH_NAME.ino.bin"
   require_file "$dir/srmodels.bin"
+  local model_file="$dir/srmodels.bin"
+  if [ -n "$MODEL_BIN" ]; then
+    require_file "$MODEL_BIN"
+    local size
+    size="$(wc -c <"$MODEL_BIN" | tr -d '[:space:]')"
+    [ "$size" -le "$((MODEL_SIZE))" ] || die "model binary is too large: ${size} bytes > $MODEL_SIZE"
+    log "Using custom WakeNet model binary: $MODEL_BIN ($size bytes)"
+    model_file="$MODEL_BIN"
+  fi
   detect_port
   resolve_esptool || die "esptool not found. Install it with: python3 -m pip install --user esptool"
   if [ "$ERASE_FLASH" -eq 1 ]; then
@@ -307,7 +335,7 @@ flash_prebuilt() {
     0x8000 "$dir/$SKETCH_NAME.ino.partitions.bin" \
     0xe000 "$dir/boot_app0.bin" \
     0x10000 "$dir/$SKETCH_NAME.ino.bin" \
-    "$MODEL_OFFSET" "$dir/srmodels.bin"
+    "$MODEL_OFFSET" "$model_file"
 }
 
 flash_from_build() {

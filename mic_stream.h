@@ -1,6 +1,7 @@
 #ifndef LAMPGO_MIC_STREAM_H
 #define LAMPGO_MIC_STREAM_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_http_server.h"
@@ -25,6 +26,7 @@ uint32_t ownerLeaseRemainingMs();
 bool isWakeReady();
 const char *wakeModel();
 const char *requestedWakeModel();
+size_t copyWakeSupportedModelsJson(char *dst, size_t dstLen);
 bool setWakeModel(const char *modelName);
 uint32_t wakeDetections();
 uint32_t lastWakeMs();
