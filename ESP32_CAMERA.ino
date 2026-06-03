@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 @ninsmiracle, @shelly-tang, and LampGo contributors
+// SPDX-License-Identifier: GPL-3.0-only
+
 #include "esp_camera.h"
 #include <WiFi.h>
 #include "FS.h"

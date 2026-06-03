@@ -6,6 +6,17 @@ Firmware for the LampGo ESP32 camera, microphone, speaker, LED, and WiFi provisi
 
 The target board is `XIAO_ESP32S3` with OPI PSRAM enabled.
 
+## License
+
+This firmware repository is distributed under GPL-3.0-only unless a file says
+otherwise. See [LICENSE](LICENSE), [AUTHORS.md](AUTHORS.md),
+[COPYRIGHT](COPYRIGHT), and [NOTICE](NOTICE).
+
+Some camera server support code is based on Espressif ESP32 examples and keeps
+its upstream Apache-2.0 notices where present. When distributing prebuilt
+firmware binaries, publish the corresponding source, build scripts, partition
+table, and flashing instructions.
+
 ## Quick Start
 
 Connect the ESP32 over USB, then list ports:

@@ -1,0 +1,20 @@
+LampGo ESP32 Firmware
+
+Copyright (C) 2026 @ninsmiracle, @shelly-tang, and LampGo contributors.
+
+Unless a file says otherwise, LampGo ESP32 firmware source code is distributed
+under GPL-3.0-only. See LICENSE for the full license text.
+
+Third-party notices:
+
+- Some camera server and board-support code is based on Espressif ESP32 camera
+  examples. Espressif Apache-2.0 notices are retained in source files where
+  present, including app_httpd.cpp.
+- app_httpd.cpp includes an upstream Espressif Apache-2.0 copyright and license
+  header. Do not remove that notice when modifying the file.
+
+Firmware distribution note:
+
+When distributing prebuilt firmware binaries, publish the corresponding source
+code, build scripts, partition table, and flashing instructions needed to
+rebuild and install the same firmware.

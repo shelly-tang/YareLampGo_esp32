@@ -1,5 +1,11 @@
 # LampGo ESP32 固件烧录指南
 
+## License
+
+本固件仓库默认基于 GPL-3.0-only 发布，除非具体文件另有说明。作者、版权和第三方归属见 [LICENSE](LICENSE)、[AUTHORS.md](AUTHORS.md)、[COPYRIGHT](COPYRIGHT) 和 [NOTICE](NOTICE)。
+
+部分摄像头服务和板级支持代码基于 Espressif ESP32 示例代码；相关文件中已有的 Apache-2.0 声明需要保留。发布预编译固件时，应同时提供对应源码、构建脚本、分区表和烧录说明。
+
 ## 先复制这个：两个快捷烧录命令
 
 如果你已经安装了 Arduino IDE，或者电脑里有 `arduino-cli`，在源码目录里运行：

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 @ninsmiracle, @shelly-tang, and LampGo contributors
+// SPDX-License-Identifier: GPL-3.0-only
+
 #ifndef LAMPGO_LED_SERIAL_H
 #define LAMPGO_LED_SERIAL_H
 
