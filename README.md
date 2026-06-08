@@ -42,6 +42,9 @@ No WiFi credentials stored. Entering provisioning mode.
 [provision] SSID: Lampgo-Setup-XXXX
 ```
 
+Connect to `Lampgo-Setup-XXXX` with the default password `lampgo123`, then
+return to the LampGo web UI to configure your normal WiFi.
+
 ## If You Have Arduino
 
 Install either:
@@ -142,7 +145,7 @@ If the LampGo web UI says WiFi scan or probe failed, connect the computer to `La
 ./scripts/provision_diag.sh
 ```
 
-The script writes a timestamped log under `logs/`. Switch back to your normal WiFi and share that log when reporting the issue. It records:
+The script writes a timestamped log under `logs/`. Switch back to your normal WiFi and share that log privately when reporting the issue. It records local network details, so avoid posting it in a public issue without reviewing it first. It records:
 
 - current WiFi/DHCP/route state
 - direct ESP32 `http://192.168.4.1/status` and `/scan`

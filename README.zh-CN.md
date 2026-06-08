@@ -121,7 +121,7 @@ No WiFi credentials stored. Entering provisioning mode.
 [provision] SSID: Lampgo-Setup-XXXX
 ```
 
-然后在电脑 WiFi 列表中连接 `Lampgo-Setup-XXXX`，回到 LampGo 网页配置家庭 WiFi。
+然后在电脑 WiFi 列表中连接 `Lampgo-Setup-XXXX`，默认密码是 `lampgo123`。连接后回到 LampGo 网页配置家庭 WiFi。
 
 ## 当前固件的通话模式
 
@@ -158,7 +158,7 @@ No WiFi credentials stored. Entering provisioning mode.
 ./scripts/provision_diag.sh
 ```
 
-脚本会把日志写到 `logs/` 目录。运行完后切回正常 WiFi，把日志发给开发者排查即可。
+脚本会把日志写到 `logs/` 目录。运行完后切回正常 WiFi，把日志私下发给开发者排查即可。日志包含本地网络信息，公开贴 issue 前请先检查内容。
 
 如果 LampGo 后端不是默认地址：
 
