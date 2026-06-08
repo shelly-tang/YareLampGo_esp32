@@ -11,7 +11,7 @@
 如果你已经安装了 Arduino IDE，或者电脑里有 `arduino-cli`，在源码目录里运行：
 
 ```bash
-cd esp32_lamp
+cd YareLampGo_esp32
 ./scripts/flash.sh --erase --monitor
 ```
 

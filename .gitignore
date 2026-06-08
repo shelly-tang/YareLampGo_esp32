@@ -1,3 +1,4 @@
+*.DS_Store
 ESP32_CAMERA.zip
 snapshot.jpg
 sent_images/

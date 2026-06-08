@@ -22,7 +22,7 @@ table, and flashing instructions.
 Connect the ESP32 over USB, then list ports:
 
 ```bash
-cd esp32_lamp
+cd YareLampGo_esp32
 ./scripts/flash.sh --list-ports
 ```
 
