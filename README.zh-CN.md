@@ -15,10 +15,10 @@ cd YareLampGo_esp32
 ./scripts/flash.sh --erase --monitor
 ```
 
-如果你没有 Arduino，只是下载了 LampGo 发布页里的预编译固件包，解压后在固件包目录里运行：
+如果你没有 Arduino，可以直接使用仓库里的预编译固件包：
 
 ```bash
-cd lampgo-esp32-firmware
+cd dist/YareLampGo_esp32-firmware
 ./flash.sh --prebuilt . --erase --monitor
 ```
 
@@ -83,7 +83,7 @@ XIAO_ESP32S3 + OPI PSRAM
 打包一个给非 Arduino 用户使用的预编译固件包：
 
 ```bash
-./scripts/flash.sh --build-only --package ./dist/lampgo-esp32-firmware
+./scripts/flash.sh --build-only --package ./dist/YareLampGo_esp32-firmware
 ```
 
 ## 没有 Arduino 的预编译包烧录

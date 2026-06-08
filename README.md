@@ -89,10 +89,10 @@ Install `esptool`:
 python3 -m pip install --user esptool
 ```
 
-Then flash the downloaded package:
+Then flash the bundled prebuilt package:
 
 ```bash
-cd lampgo-esp32-firmware
+cd dist/YareLampGo_esp32-firmware
 ./flash.sh --prebuilt . --port /dev/cu.usbmodem2101 --erase --monitor
 ```
 
@@ -103,7 +103,7 @@ This path does not require Arduino IDE or `arduino-cli`.
 To create a prebuilt package for users who do not have Arduino:
 
 ```bash
-./scripts/flash.sh --build-only --package ./dist/lampgo-esp32-firmware
+./scripts/flash.sh --build-only --package ./dist/YareLampGo_esp32-firmware
 ```
 
 Upload the generated directory or zip it for a GitHub release. The package includes a copy of `flash.sh`, so users without Arduino can flash from inside the unzipped package.
