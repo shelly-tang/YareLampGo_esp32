@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "led_serial.h"
+#include "display_link.h"
 
 #include <Arduino.h>
 #include <ctype.h>
@@ -18,11 +19,11 @@
 #endif
 
 #ifndef LAMPGO_LED_PANEL_PIXELS
-#define LAMPGO_LED_PANEL_PIXELS 64
+#define LAMPGO_LED_PANEL_PIXELS 447
 #endif
 
 #ifndef LAMPGO_LED_PANEL_COUNT
-#define LAMPGO_LED_PANEL_COUNT 2
+#define LAMPGO_LED_PANEL_COUNT 1
 #endif
 
 #define LAMPGO_LED_PIXEL_COUNT (LAMPGO_LED_PANEL_PIXELS * LAMPGO_LED_PANEL_COUNT)
@@ -33,10 +34,16 @@
 
 namespace {
 
-constexpr int kPanelRows = 8;
-constexpr int kPanelCols = 8;
-constexpr int kCombinedCols = 16;
+constexpr int kPanelRows = 9;
+constexpr int kCombinedCols = 51;
 constexpr int kMaxMode = 33;
+constexpr int kPatternRows = 8;
+constexpr int kPatternCols = 16;
+constexpr int kIrregularRowCount = 9;
+constexpr int kIrregularMaxCols = 51;
+
+const int kIrregularRowLengths[kIrregularRowCount] = {47, 49, 51, 51, 51, 51, 51, 49, 47};
+const int kIrregularRowStarts[kIrregularRowCount] = {0, 47, 96, 147, 198, 249, 300, 351, 400};
 
 SemaphoreHandle_t g_mutex = nullptr;
 TaskHandle_t g_task = nullptr;
@@ -46,7 +53,7 @@ bool g_rmtReady = false;
 bool g_lastShowOk = false;
 bool g_useEllipseMask = false;
 int g_mode = 0;
-int g_brightness = 127;
+int g_brightness = 64;
 uint32_t g_lastWriteMs = 0;
 uint32_t g_animFrame = 0;
 uint32_t g_lastFrameMs = 0;
@@ -497,21 +504,6 @@ uint8_t scaledBrightness(uint8_t level) {
   return (uint8_t)((g_brightness * (uint16_t)level) / 255);
 }
 
-bool isEllipseMasked(int panelIndex, int ledIndex) {
-  if (panelIndex == 0) {
-    if (ledIndex == 0 || ledIndex == 1) return true;
-    if (ledIndex == 8) return true;
-    if (ledIndex == 48) return true;
-    if (ledIndex == 56 || ledIndex == 57) return true;
-  } else if (panelIndex == 1) {
-    if (ledIndex == 6 || ledIndex == 7) return true;
-    if (ledIndex == 15) return true;
-    if (ledIndex == 55) return true;
-    if (ledIndex == 62 || ledIndex == 63) return true;
-  }
-  return false;
-}
-
 void setPhysicalPixel(int pixelIndex, uint32_t pixelColor) {
   if (pixelIndex < 0 || pixelIndex >= LAMPGO_LED_PIXEL_COUNT) return;
   int offset = pixelIndex * 3;
@@ -520,28 +512,66 @@ void setPhysicalPixel(int pixelIndex, uint32_t pixelColor) {
   g_pixels[offset + 2] = (uint8_t)(pixelColor & 0xFF);
 }
 
-void setPanelPixel(int panelIndex, int ledIndex, uint32_t pixelColor) {
-  if (panelIndex < 0 || panelIndex >= LAMPGO_LED_PANEL_COUNT) return;
-  if (ledIndex < 0 || ledIndex >= LAMPGO_LED_PANEL_PIXELS) return;
-  if (g_useEllipseMask && isEllipseMasked(panelIndex, ledIndex)) {
-    pixelColor = 0;
+int irregularPixelIndex(int row, int col) {
+  if (row < 0 || row >= kIrregularRowCount || col < 0 || col >= kIrregularMaxCols) {
+    return -1;
   }
-  setPhysicalPixel(panelIndex * LAMPGO_LED_PANEL_PIXELS + ledIndex, pixelColor);
+  int rowLength = kIrregularRowLengths[row];
+  int leftPad = (kIrregularMaxCols - rowLength) / 2;
+  int localCol = col - leftPad;
+  if (localCol < 0 || localCol >= rowLength) return -1;
+  return kIrregularRowStarts[row] + localCol;
 }
 
-void setMirroredPixel(int ledIndex, uint32_t pixelColor) {
-  if (ledIndex < 0 || ledIndex >= LAMPGO_LED_PANEL_PIXELS) return;
-  for (int panel = 0; panel < LAMPGO_LED_PANEL_COUNT; ++panel) {
-    setPanelPixel(panel, ledIndex, pixelColor);
+void setMatrixPixel(int row, int col, uint32_t pixelColor) {
+  int pixelIndex = irregularPixelIndex(row, col);
+  if (pixelIndex >= 0) {
+    setPhysicalPixel(pixelIndex, pixelColor);
   }
 }
 
 void setCombinedPixel(int row, int col, uint32_t pixelColor) {
   if (row < 0 || row >= kPanelRows || col < 0 || col >= kCombinedCols) return;
-  int panel = col < kPanelCols ? 0 : 1;
-  int ledCol = col < kPanelCols ? col : col - kPanelCols;
-  int ledIndex = row * kPanelCols + ledCol;
-  setPanelPixel(panel, ledIndex, pixelColor);
+  setMatrixPixel(kPanelRows - 1 - row, kCombinedCols - 1 - col, pixelColor);
+}
+
+void fillLogicalCell(int row, int col, uint32_t pixelColor) {
+  int row0 = row * kPanelRows / kPatternRows;
+  int row1 = ((row + 1) * kPanelRows + kPatternRows - 1) / kPatternRows;
+  int col0 = col * kCombinedCols / kPatternCols;
+  int col1 = ((col + 1) * kCombinedCols + kPatternCols - 1) / kPatternCols;
+  if (row1 <= row0) row1 = row0 + 1;
+  if (col1 <= col0) col1 = col0 + 1;
+  for (int targetRow = row0; targetRow < row1; ++targetRow) {
+    for (int targetCol = col0; targetCol < col1; ++targetCol) {
+      setCombinedPixel(targetRow, targetCol, pixelColor);
+    }
+  }
+}
+
+void drawBitmap8OnMatrix(const uint8_t bitmap[8][8], uint32_t pixelColor, int colOffset, int rowOffset = 0) {
+  for (int row = 0; row < 8; ++row) {
+    int shiftedRow = row + rowOffset;
+    if (shiftedRow < 0 || shiftedRow >= 8) continue;
+    for (int col = 0; col < 8; ++col) {
+      if (bitmap[row][col] == 1) {
+        fillLogicalCell(shiftedRow, col + colOffset, pixelColor);
+      }
+    }
+  }
+}
+
+void drawBitmap8PairCell(const uint8_t bitmap[8][8], uint32_t pixelColor, int cellOffset, int rowOffset = 0) {
+  for (int row = 0; row < 8; ++row) {
+    int shiftedRow = row + rowOffset;
+    if (shiftedRow < 0 || shiftedRow >= 8) continue;
+    for (int col = 0; col < 8; ++col) {
+      if (bitmap[row][col] == 1) {
+        int mappedCol = (col * 6) / 8;
+        fillLogicalCell(shiftedRow, mappedCol + cellOffset, pixelColor);
+      }
+    }
+  }
 }
 
 void clearPixels() {
@@ -622,15 +652,24 @@ bool showPixelsLocked() {
 }
 
 void drawBitmap8(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset = 0) {
-  for (int row = 0; row < 8; ++row) {
-    int shiftedRow = row + rowOffset;
-    if (shiftedRow < 0 || shiftedRow >= 8) continue;
-    for (int col = 0; col < 8; ++col) {
-      if (bitmap[row][col] == 1) {
-        setMirroredPixel(shiftedRow * 8 + col, pixelColor);
-      }
-    }
-  }
+  drawBitmap8OnMatrix(bitmap, pixelColor, 4, rowOffset);
+}
+
+void drawBitmap8Pair(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset = 0) {
+  drawBitmap8PairCell(bitmap, pixelColor, 1, rowOffset);
+  drawBitmap8PairCell(bitmap, pixelColor, 9, rowOffset);
+}
+
+void drawBitmap8PairWithBottomDots(const uint8_t bitmap[8][8], uint32_t pixelColor) {
+  drawBitmap8Pair(bitmap, pixelColor);
+  fillLogicalCell(6, 3, pixelColor);
+  fillLogicalCell(7, 3, pixelColor);
+  fillLogicalCell(6, 4, pixelColor);
+  fillLogicalCell(7, 4, pixelColor);
+  fillLogicalCell(6, 11, pixelColor);
+  fillLogicalCell(7, 11, pixelColor);
+  fillLogicalCell(6, 12, pixelColor);
+  fillLogicalCell(7, 12, pixelColor);
 }
 
 void drawCombinedPattern(int patternIndex, uint32_t primaryColor, uint32_t secondaryColor = 0) {
@@ -639,21 +678,21 @@ void drawCombinedPattern(int patternIndex, uint32_t primaryColor, uint32_t secon
       patternIndex >= (int)(sizeof(kCombinedPatterns) / sizeof(kCombinedPatterns[0]))) {
     return;
   }
-  for (int row = 0; row < 8; ++row) {
-    for (int col = 0; col < 16; ++col) {
+  for (int row = 0; row < kPatternRows; ++row) {
+    for (int col = 0; col < kPatternCols; ++col) {
       uint8_t value = kCombinedPatterns[patternIndex][row][col];
       if (value == 0) continue;
-      setCombinedPixel(row, col, value == 2 ? secondaryColor : primaryColor);
+      fillLogicalCell(row, col, value == 2 ? secondaryColor : primaryColor);
     }
   }
 }
 
 void renderRingFill(uint32_t pixelColor, uint32_t frame) {
   clearPixels();
-  int maxRing = (int)(frame > 3 ? 3 : frame);
-  for (int row = 0; row < 8; ++row) {
-    for (int col = 0; col < 16; ++col) {
-      int ring = min(min(row, 7 - row), min(col, 15 - col));
+  int maxRing = (int)(frame > 4 ? 4 : frame);
+  for (int row = 0; row < kPanelRows; ++row) {
+    for (int col = 0; col < kCombinedCols; ++col) {
+      int ring = min(min(row, kPanelRows - 1 - row), min(col, kCombinedCols - 1 - col));
       if (ring <= maxRing) {
         setCombinedPixel(row, col, pixelColor);
       }
@@ -665,9 +704,7 @@ void renderTheater(uint32_t pixelColor, uint32_t frame) {
   clearPixels();
   int start = (int)(frame % 3);
   for (int index = start; index < LAMPGO_LED_PIXEL_COUNT; index += 3) {
-    int panel = index / LAMPGO_LED_PANEL_PIXELS;
-    int ledIndex = index % LAMPGO_LED_PANEL_PIXELS;
-    setPanelPixel(panel, ledIndex, pixelColor);
+    setPhysicalPixel(index, pixelColor);
   }
 }
 
@@ -676,9 +713,7 @@ void renderRainbow(uint32_t frame) {
   uint16_t firstHue = (uint16_t)((frame * 256U) & 0xFFFF);
   for (int index = 0; index < LAMPGO_LED_PIXEL_COUNT; ++index) {
     uint16_t hue = firstHue + (uint32_t)index * 65536UL / LAMPGO_LED_PIXEL_COUNT;
-    int panel = index / LAMPGO_LED_PANEL_PIXELS;
-    int ledIndex = index % LAMPGO_LED_PANEL_PIXELS;
-    setPanelPixel(panel, ledIndex, hsvColor(hue, 255, g_brightness));
+    setPhysicalPixel(index, hsvColor(hue, 255, g_brightness));
   }
 }
 
@@ -688,9 +723,7 @@ void renderRainbowChase(uint32_t frame) {
   uint16_t firstHue = (uint16_t)(((frame * (65536U / 90U))) & 0xFFFF);
   for (int index = start; index < LAMPGO_LED_PIXEL_COUNT; index += 3) {
     uint16_t hue = firstHue + (uint32_t)index * 65536UL / LAMPGO_LED_PIXEL_COUNT;
-    int panel = index / LAMPGO_LED_PANEL_PIXELS;
-    int ledIndex = index % LAMPGO_LED_PANEL_PIXELS;
-    setPanelPixel(panel, ledIndex, hsvColor(hue, 255, g_brightness));
+    setPhysicalPixel(index, hsvColor(hue, 255, g_brightness));
   }
 }
 
@@ -704,13 +737,13 @@ void renderMusic(uint32_t frame) {
   };
 
   clearPixels();
-  drawBitmap8(kMusicNote, colors[(frame / 7) % 4], offsets[frame % 7]);
+  drawBitmap8Pair(kMusicNote, colors[(frame / 7) % 4], offsets[frame % 7]);
 }
 
 void renderThinking(uint32_t frame) {
   clearPixels();
   uint8_t low = g_brightness / 10;
-  drawBitmap8(kCirclePattern, color(low, low, low));
+  drawBitmap8Pair(kCirclePattern, color(low, low, low));
 
   static const uint8_t path[20][2] = {
       {0,2},{0,3},{0,4},{0,5},{1,6},{2,7},{3,7},{4,7},{5,7},{6,6},
@@ -718,7 +751,8 @@ void renderThinking(uint32_t frame) {
   };
 
   const uint8_t *point = path[frame % 20];
-  setMirroredPixel(point[0] * 8 + point[1], color(g_brightness, g_brightness, g_brightness));
+  fillLogicalCell(point[0], (point[1] * 6) / 8 + 1, color(g_brightness, g_brightness, g_brightness));
+  fillLogicalCell(point[0], (point[1] * 6) / 8 + 9, color(g_brightness, g_brightness, g_brightness));
 }
 
 void renderHeart(uint32_t frame) {
@@ -875,23 +909,23 @@ void renderCurrentLocked() {
       break;
     case 15:
       clearPixels();
-      drawBitmap8(kCheckPattern, color(0, g_brightness, 0));
+      drawBitmap8Pair(kCheckPattern, color(0, g_brightness, 0));
       break;
     case 16:
       clearPixels();
-      drawBitmap8(kCrossPattern, color(g_brightness, 0, 0));
+      drawBitmap8Pair(kCrossPattern, color(g_brightness, 0, 0));
       break;
     case 17:
       clearPixels();
-      drawBitmap8(kExclaimPattern, color(g_brightness, (uint8_t)(g_brightness * 7 / 10), 0));
+      drawBitmap8PairWithBottomDots(kExclaimPattern, color(g_brightness, (uint8_t)(g_brightness * 7 / 10), 0));
       break;
     case 18:
       clearPixels();
-      drawBitmap8(kQuestionPattern, color(g_brightness, 0, 0));
+      drawBitmap8PairWithBottomDots(kQuestionPattern, color(g_brightness, 0, 0));
       break;
     case 19:
       clearPixels();
-      drawBitmap8(kStarPattern, color(g_brightness, g_brightness, 0));
+      drawBitmap8Pair(kStarPattern, color(g_brightness, g_brightness, 0));
       break;
     case 20:
       renderMusic(g_animFrame);
@@ -1077,6 +1111,7 @@ bool setMode(int mode) {
   giveLedLock();
 
   Serial.printf("[led_matrix] mode=%d name=%s pin=%d\n", mode, modeName(mode), (int)LAMPGO_LED_PIXEL_PIN);
+  DisplayLink::sendExpression(modeName(mode));
   return ok;
 }
 

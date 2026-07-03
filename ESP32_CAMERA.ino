@@ -8,6 +8,7 @@
 #include "SPI.h"
 
 #include "avi_recorder.h"
+#include "display_link.h"
 #include "led_serial.h"
 #include "net_config.h"
 #include "provision_ap.h"
@@ -123,14 +124,18 @@ void setup() {
                 NetConfig::deviceIdSuffix().c_str(),
                 NetConfig::deviceHostname().c_str());
 
+  DisplayLink::begin();
+
   if (!NetConfig::hasCredentials()) {
     Serial.println("No WiFi credentials stored. Entering provisioning mode.");
+    DisplayLink::sendStatus("provision", "Connect to Lampgo-Setup WiFi");
     ProvisionAP::start();
     return;
   }
 
   if (!WorkMode::connectNetwork()) {
     Serial.println("WiFi connect failed. Clearing credentials and entering provisioning mode.");
+    DisplayLink::sendStatus("wifi_failed", "Entering setup mode");
     NetConfig::clearWifi();
     ProvisionAP::start();
     return;
@@ -144,7 +149,9 @@ void setup() {
 
   if (!WorkMode::startServices()) {
     Serial.println("Work services failed. Halting.");
+    DisplayLink::sendStatus("service_failed", "Work services failed");
     while (true) {
+      DisplayLink::loop();
       delay(1000);
     }
   }
@@ -154,9 +161,13 @@ void setup() {
   if (g_sdReady) {
     startRecording();
   }
+
+  DisplayLink::sendStatus("ready", NetConfig::deviceHostname().c_str());
 }
 
 void loop() {
+  DisplayLink::loop();
+
   if (ProvisionAP::isActive()) {
     ProvisionAP::loop();
   } else if (WorkMode::isActive()) {
