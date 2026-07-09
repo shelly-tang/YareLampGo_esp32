@@ -9,6 +9,7 @@
 
 #include "avi_recorder.h"
 #include "display_link.h"
+#include "expression_clips.h"
 #include "led_serial.h"
 #include "net_config.h"
 #include "provision_ap.h"
@@ -125,6 +126,7 @@ void setup() {
                 NetConfig::deviceHostname().c_str());
 
   DisplayLink::begin();
+  ExpressionClips::begin();
 
   if (!NetConfig::hasCredentials()) {
     Serial.println("No WiFi credentials stored. Entering provisioning mode.");

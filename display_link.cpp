@@ -25,7 +25,12 @@ void sendLine(const String &line) {
   if (!g_ready) return;
   g_displaySerial.print(line);
   g_displaySerial.print('\n');
-  Serial.printf("[display_link] %s\n", line.c_str());
+  g_displaySerial.flush();
+  if (line.indexOf("\"type\":\"clip_chunk\"") >= 0) {
+    Serial.printf("[display_link] clip_chunk bytes=%u\n", line.length());
+  } else {
+    Serial.printf("[display_link] %s\n", line.c_str());
+  }
 }
 
 String escapeJson(const char *value) {
@@ -74,6 +79,51 @@ void sendStatus(const char *status, const char *detail) {
 void sendExpression(const char *expression) {
   String line = "{\"type\":\"expression\",\"name\":\"";
   line += escapeJson(expression);
+  line += "\"}";
+  sendLine(line);
+}
+
+void sendClipBegin(const char *clipId, int fps, int frameCount, int durationMs, size_t lcdBytes, const char *lcdSha256) {
+  String line = "{\"type\":\"clip_begin\",\"clip_id\":\"";
+  line += escapeJson(clipId);
+  line += "\",\"fps\":";
+  line += fps;
+  line += ",\"frame_count\":";
+  line += frameCount;
+  line += ",\"duration_ms\":";
+  line += durationMs;
+  line += ",\"lcd_bytes\":";
+  line += (unsigned)lcdBytes;
+  line += ",\"lcd_sha256\":\"";
+  line += escapeJson(lcdSha256 ? lcdSha256 : "");
+  line += "\"";
+  line += "}";
+  sendLine(line);
+  delay(300);
+}
+
+void sendClipChunk(const char *clipId, size_t offset, const char *hexData) {
+  String line = "{\"type\":\"clip_chunk\",\"clip_id\":\"";
+  line += escapeJson(clipId);
+  line += "\",\"target\":\"lcd\",\"offset\":";
+  line += (unsigned)offset;
+  line += ",\"data\":\"";
+  line += escapeJson(hexData);
+  line += "\"}";
+  sendLine(line);
+  delay(15);
+}
+
+void sendClipCommit(const char *clipId) {
+  String line = "{\"type\":\"clip_commit\",\"clip_id\":\"";
+  line += escapeJson(clipId);
+  line += "\"}";
+  sendLine(line);
+}
+
+void sendClipPlay(const char *clipId) {
+  String line = "{\"type\":\"clip_play\",\"clip_id\":\"";
+  line += escapeJson(clipId);
   line += "\"}";
   sendLine(line);
 }

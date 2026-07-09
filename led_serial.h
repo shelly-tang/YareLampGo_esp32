@@ -14,6 +14,7 @@ bool isReady();
 bool setMode(int mode);
 bool setModeName(const char *name);
 bool setBrightness(int brightness);
+bool playClip(const char *clipId);
 
 int resolveMode(const char *name);
 const char *modeName(int mode);

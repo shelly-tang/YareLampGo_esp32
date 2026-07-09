@@ -62,6 +62,13 @@ char g_lastCommand[32] = "";
 uint8_t g_pixels[LAMPGO_LED_PIXEL_COUNT * 3] = {0};
 rmt_data_t *g_rmtData = nullptr;
 
+bool g_clipActive = false;
+char g_clipId[40] = "";
+uint16_t g_clipFrameCount = 0;
+uint16_t g_clipFps = 0;
+uint32_t g_clipFrame = 0;
+uint32_t g_clipLastFrameMs = 0;
+
 bool g_focusEyesOpen = true;
 uint8_t g_focusBlinksRemaining = 0;
 uint32_t g_focusNextTransitionMs = 0;
@@ -578,6 +585,90 @@ void clearPixels() {
   memset(g_pixels, 0, sizeof(g_pixels));
 }
 
+void releaseClipLocked() {
+  g_clipActive = false;
+  g_clipId[0] = 0;
+  g_clipFrameCount = 0;
+  g_clipFps = 0;
+  g_clipFrame = 0;
+  g_clipLastFrameMs = 0;
+}
+
+bool showPixelsLocked();
+
+void drawDizzyMouthLocked(uint32_t frameIndex) {
+  int phase = (int)(frameIndex % 30);
+  int wave = phase <= 15 ? phase : 30 - phase;
+  int cx = 25 + ((phase % 6) < 3 ? -1 : 1);
+  int cy = 4;
+  int halfW = 12 + (wave * 13) / 15;
+  int halfH = 2 + (wave * 3) / 15;
+  uint32_t white = color(g_brightness, g_brightness, g_brightness);
+  uint32_t cyan = color(0, scaledBrightness(210), g_brightness);
+  uint32_t blue = color(0, scaledBrightness(95), g_brightness);
+  uint32_t pink = color(g_brightness, scaledBrightness(45), scaledBrightness(125));
+  uint32_t deep = color(scaledBrightness(105), 0, scaledBrightness(45));
+  uint32_t yellow = color(g_brightness, scaledBrightness(210), 0);
+
+  int innerW = halfW > 4 ? halfW - 3 : halfW;
+  int innerH = halfH > 2 ? halfH - 1 : halfH;
+  for (int row = 0; row < kPanelRows; ++row) {
+    for (int col = 0; col < kCombinedCols; ++col) {
+      int dx = col - cx;
+      int dy = row - cy;
+      int outer = (dx * dx * 100) / (halfW * halfW) + (dy * dy * 100) / (halfH * halfH);
+      int inner = (dx * dx * 100) / (innerW * innerW) + (dy * dy * 100) / (innerH * innerH);
+      if (outer <= 112 && inner >= 58) {
+        setCombinedPixel(row, col, row > cy + 1 ? pink : white);
+      } else if (outer <= 50 && wave > 6 && row >= cy) {
+        setCombinedPixel(row, col, ((col + phase) % 2) ? deep : pink);
+      }
+    }
+  }
+
+  int left = cx - halfW;
+  int right = cx + halfW;
+  for (int i = 0; i < 4; ++i) {
+    uint32_t accent = (i % 2) ? cyan : blue;
+    setCombinedPixel(3 + (i % 2), left - 2 + i, accent);
+    setCombinedPixel(5 - (i % 2), right + 2 - i, accent);
+  }
+  if (wave > 5) {
+    setCombinedPixel(1, left - 4, yellow);
+    setCombinedPixel(2, left - 5, yellow);
+    setCombinedPixel(6, right + 4, yellow);
+    setCombinedPixel(7, right + 5, yellow);
+  }
+}
+
+void drawGenericClipMarkerLocked(uint32_t frameIndex) {
+  int phase = (int)(frameIndex % 30);
+  int wave = phase <= 15 ? phase : 30 - phase;
+  int halfW = 10 + (wave * 10) / 15;
+  uint32_t white = color(g_brightness, g_brightness, g_brightness);
+  uint32_t cyan = color(0, scaledBrightness(180), g_brightness);
+  for (int col = 25 - halfW; col <= 25 + halfW; ++col) {
+    setCombinedPixel(4, col, white);
+    if (wave > 7) {
+      setCombinedPixel(3, col, cyan);
+      setCombinedPixel(5, col, cyan);
+    }
+  }
+}
+
+void renderClipFrameLocked(uint32_t frameIndex) {
+  if (!g_clipActive || g_clipFrameCount == 0) return;
+  clearPixels();
+  char key[32];
+  normalizeKey(g_clipId, key, sizeof(key));
+  if (strcmp(key, "dizzy") == 0) {
+    drawDizzyMouthLocked(frameIndex);
+  } else {
+    drawGenericClipMarkerLocked(frameIndex);
+  }
+  showPixelsLocked();
+}
+
 uint32_t hsvColor(uint16_t hue, uint8_t sat, uint8_t val) {
   uint8_t region = hue / 10923;
   uint16_t remainder = (hue - (region * 10923)) * 6;
@@ -1028,7 +1119,15 @@ void ledTask(void *) {
       uint32_t now = millis();
       if (g_mutex && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         bool shouldRender = false;
-        if (g_mode == 31) {
+        if (g_clipActive) {
+          uint32_t interval = g_clipFps > 0 ? (1000UL / g_clipFps) : 100;
+          if (interval < 16) interval = 16;
+          if (g_clipLastFrameMs == 0 || now - g_clipLastFrameMs >= interval) {
+            g_clipFrame = (g_clipFrame + 1) % g_clipFrameCount;
+            g_clipLastFrameMs = now;
+            shouldRender = true;
+          }
+        } else if (g_mode == 31) {
           shouldRender = updateFocusedAnimationLocked(now);
         } else if (modeIsAnimated(g_mode) && !animationIsComplete(g_mode)) {
           if (g_lastFrameMs == 0 || now - g_lastFrameMs >= frameIntervalMs(g_mode)) {
@@ -1038,7 +1137,11 @@ void ledTask(void *) {
           }
         }
         if (shouldRender) {
-          renderCurrentLocked();
+          if (g_clipActive) {
+            renderClipFrameLocked(g_clipFrame);
+          } else {
+            renderCurrentLocked();
+          }
         }
         xSemaphoreGive(g_mutex);
       }
@@ -1104,6 +1207,7 @@ bool setMode(int mode) {
   char command[8];
   snprintf(command, sizeof(command), "m%d", mode);
   recordCommand(command);
+  releaseClipLocked();
   g_mode = mode;
   resetAnimationStateLocked(millis());
   renderCurrentLocked();
@@ -1132,12 +1236,39 @@ bool setBrightness(int brightness) {
   snprintf(command, sizeof(command), "b%d", brightness);
   recordCommand(command);
   g_brightness = brightness;
-  resetAnimationStateLocked(millis());
-  renderCurrentLocked();
+  if (g_clipActive) {
+    renderClipFrameLocked(g_clipFrame);
+  } else {
+    resetAnimationStateLocked(millis());
+    renderCurrentLocked();
+  }
   bool ok = g_lastShowOk;
   giveLedLock();
 
   Serial.printf("[led_matrix] brightness=%d pin=%d\n", brightness, (int)LAMPGO_LED_PIXEL_PIN);
+  return ok;
+}
+
+bool playClip(const char *clipId) {
+  if (!g_ready || !clipId || !clipId[0] || !takeLedLock()) {
+    return false;
+  }
+
+  releaseClipLocked();
+  snprintf(g_clipId, sizeof(g_clipId), "%s", clipId);
+  g_clipActive = true;
+  g_clipFrameCount = 30;
+  g_clipFps = 10;
+  g_clipFrame = 0;
+  g_clipLastFrameMs = millis();
+  recordCommand("clip");
+  renderClipFrameLocked(0);
+  bool ok = g_lastShowOk;
+  giveLedLock();
+
+  Serial.printf("[led_matrix] procedural clip=%s frames=%u fps=%u\n",
+                clipId, (unsigned)g_clipFrameCount, (unsigned)g_clipFps);
+  DisplayLink::sendClipPlay(clipId);
   return ok;
 }
 

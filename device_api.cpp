@@ -10,6 +10,8 @@
 #include <esp_heap_caps.h>
 #include <esp_camera.h>
 
+#include "display_link.h"
+#include "expression_clips.h"
 #include "led_serial.h"
 #include "mic_stream.h"
 #include "net_config.h"
@@ -678,6 +680,18 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
     applied++;
   }
 
+  bool clipPlayed = false;
+  const cJSON *clipJson = cJSON_GetObjectItemCaseSensitive(doc, "clip_id");
+  if (cJSON_IsString(clipJson) && clipJson->valuestring && clipJson->valuestring[0]) {
+    if (LedSerial::playClip(clipJson->valuestring)) {
+      Serial.printf("[device_api] /device/led clip=%s\n", clipJson->valuestring);
+      applied++;
+      clipPlayed = true;
+    } else {
+      Serial.printf("[device_api] /device/led clip fallback=%s\n", clipJson->valuestring);
+    }
+  }
+
   int mode = -1;
   bool modeRequested = false;
   const cJSON *modeJson = cJSON_GetObjectItemCaseSensitive(doc, "mode");
@@ -699,7 +713,7 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
     }
   }
 
-  if (mode >= 0) {
+  if (!clipPlayed && mode >= 0) {
     if (mode > LedSerial::maxMode()) {
       cJSON_Delete(doc);
       httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be 0-33");
@@ -712,7 +726,7 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
     }
     Serial.printf("[device_api] /device/led mode=%d name=%s\n", mode, LedSerial::modeName(mode));
     applied++;
-  } else if (modeRequested) {
+  } else if (!clipPlayed && modeRequested) {
     cJSON_Delete(doc);
     httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown led mode");
     return ESP_FAIL;
@@ -730,6 +744,88 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
   cJSON_AddNumberToObject(root, "applied", applied);
   addLedStatus(root);
   addLedSupportedModes(root);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+
+  cJSON *doc = readJsonBody(req, 4096);
+  if (!doc) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad json");
+    return ESP_FAIL;
+  }
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    Serial.println("[device_api] /device/expression-clips/sync rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+
+  String action = jsonString(doc, "action");
+  String clipId = jsonString(doc, "clip_id");
+  bool ok = false;
+
+  if (action == "begin") {
+    String expression = jsonString(doc, "expression");
+    int fps = 0;
+    int frameCount = 0;
+    int durationMs = 0;
+    size_t lcdBytes = 0;
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(doc, "fps");
+    if (cJSON_IsNumber(item)) fps = item->valueint;
+    item = cJSON_GetObjectItemCaseSensitive(doc, "frame_count");
+    if (cJSON_IsNumber(item)) frameCount = item->valueint;
+    item = cJSON_GetObjectItemCaseSensitive(doc, "duration_ms");
+    if (cJSON_IsNumber(item)) durationMs = item->valueint;
+    item = cJSON_GetObjectItemCaseSensitive(doc, "lcd_bytes");
+    if (cJSON_IsNumber(item)) lcdBytes = (size_t)item->valuedouble;
+    String lcdSha = jsonString(doc, "lcd_sha256");
+    ok = ExpressionClips::beginSync(clipId.c_str(),
+                                    expression.c_str(),
+                                    fps,
+                                    frameCount,
+                                    durationMs,
+                                    lcdBytes,
+                                    lcdSha.c_str());
+    if (ok) {
+      DisplayLink::sendClipBegin(clipId.c_str(), fps, frameCount, durationMs, lcdBytes, lcdSha.c_str());
+    }
+  } else if (action == "chunk") {
+    String target = jsonString(doc, "target");
+    String data = jsonString(doc, "data");
+    size_t offset = 0;
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(doc, "offset");
+    if (cJSON_IsNumber(item)) offset = (size_t)item->valuedouble;
+    ok = ExpressionClips::appendChunk(clipId.c_str(), target.c_str(), offset, data.c_str());
+    if (ok && target == "lcd") {
+      DisplayLink::sendClipChunk(clipId.c_str(), offset, data.c_str());
+    }
+  } else if (action == "commit") {
+    ok = ExpressionClips::commitSync(clipId.c_str());
+    if (ok) {
+      DisplayLink::sendClipCommit(clipId.c_str());
+    }
+  } else if (action == "delete") {
+    ok = ExpressionClips::removeClip(clipId.c_str());
+  } else {
+    cJSON_Delete(doc);
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "unknown sync action");
+    return ESP_FAIL;
+  }
+
+  cJSON_Delete(doc);
+  if (!ok) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", false);
+    cJSON_AddStringToObject(root, "error", ExpressionClips::lastError());
+    httpd_resp_set_status(req, "400 Bad Request");
+    return sendJson(req, root);
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddStringToObject(root, "clip_id", clipId.c_str());
+  cJSON_AddStringToObject(root, "action", action.c_str());
   return sendJson(req, root);
 }
 
@@ -912,6 +1008,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/config", .method = HTTP_POST, .handler = deviceConfigPostHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_GET, .handler = deviceLedGetHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_POST, .handler = deviceLedPostHandler, .user_ctx = NULL},
+      {.uri = "/device/expression-clips/sync", .method = HTTP_POST, .handler = deviceExpressionClipSyncHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_POST, .handler = devicePairHandler, .user_ctx = NULL},
       {.uri = "/device/unpair", .method = HTTP_POST, .handler = deviceUnpairHandler, .user_ctx = NULL},
       {.uri = "/device/claim", .method = HTTP_POST, .handler = deviceClaimHandler, .user_ctx = NULL},
@@ -922,6 +1019,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/debug/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/expression-clips/sync", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/unpair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/claim", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
