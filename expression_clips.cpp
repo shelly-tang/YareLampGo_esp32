@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 #include "expression_clips.h"
+#include "expression_store.h"
 
 #include <Arduino.h>
 #include <SPIFFS.h>
@@ -13,7 +14,7 @@
 namespace ExpressionClips {
 namespace {
 
-constexpr size_t kMaxLcdBytes = 720 * 1024;
+constexpr size_t kMaxLcdBytes = 256 * 1024;
 
 bool g_ready = false;
 char g_lastError[96] = "";
@@ -109,6 +110,35 @@ bool appendHexToFile(const char *path, size_t expectedOffset, const char *hexDat
     }
   }
   if (used > 0 && file.write(buffer, used) != used) {
+    file.close();
+    setError("write clip chunk failed");
+    return false;
+  }
+  file.close();
+  g_lastError[0] = 0;
+  return true;
+}
+
+bool appendBytesToFile(const char *path, size_t expectedOffset, const uint8_t *data, size_t len) {
+  if (!data && len > 0) {
+    setError("missing byte data");
+    return false;
+  }
+
+  File check = SPIFFS.open(path, "r");
+  size_t currentSize = check ? check.size() : 0;
+  if (check) check.close();
+  if (currentSize != expectedOffset) {
+    setError("chunk offset mismatch");
+    return false;
+  }
+
+  File file = SPIFFS.open(path, expectedOffset == 0 ? "w" : "a");
+  if (!file) {
+    setError("open clip file failed");
+    return false;
+  }
+  if (len > 0 && file.write(data, len) != len) {
     file.close();
     setError("write clip chunk failed");
     return false;
@@ -240,6 +270,10 @@ bool beginSync(const char *clipId,
     return false;
   }
   SPIFFS.remove(lcd);
+  if (!ExpressionStore::canStageLcd(lcdBytes)) {
+    setError(ExpressionStore::lastError());
+    return false;
+  }
   if (buildPath(clipId, "led.bin", staleLed, sizeof(staleLed))) {
     SPIFFS.remove(staleLed);
   }
@@ -281,6 +315,18 @@ bool appendChunk(const char *clipId, const char *target, size_t offset, const ch
   return appendHexToFile(path, offset, hexData);
 }
 
+bool appendBytes(const char *clipId, const char *target, size_t offset, const uint8_t *data, size_t len) {
+  if (!begin()) return false;
+  char path[64];
+  if (strcmp(target ? target : "", "lcd") == 0) {
+    if (!lcdPath(clipId, path, sizeof(path))) return false;
+  } else {
+    setError("target must be lcd");
+    return false;
+  }
+  return appendBytesToFile(path, offset, data, len);
+}
+
 bool commitSync(const char *clipId) {
   if (!begin()) return false;
   char lcd[64];
@@ -312,6 +358,18 @@ bool commitSync(const char *clipId) {
   }
   Serial.printf("[expression_clips] committed clip=%s lcd=%u led=procedural\n",
                 clipId, (unsigned)lcdSize);
+  g_lastError[0] = 0;
+  return true;
+}
+
+bool releaseLcdPayload(const char *clipId) {
+  if (!begin()) return false;
+  char lcd[64];
+  if (!lcdPath(clipId, lcd, sizeof(lcd))) return false;
+  if (SPIFFS.exists(lcd) && !SPIFFS.remove(lcd)) {
+    setError("staging cleanup failed");
+    return false;
+  }
   g_lastError[0] = 0;
   return true;
 }

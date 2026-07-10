@@ -6,12 +6,14 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <cJSON.h>
 #include <esp_heap_caps.h>
 #include <esp_camera.h>
 
 #include "display_link.h"
 #include "expression_clips.h"
+#include "expression_store.h"
 #include "led_serial.h"
 #include "mic_stream.h"
 #include "net_config.h"
@@ -19,7 +21,7 @@
 
 namespace {
 
-const char *FIRMWARE_VERSION = "lampgo-cam 0.3.2";
+const char *FIRMWARE_VERSION = "lampgo-cam 0.4.0";
 
 bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
   if (!dst || !used || !src || *used >= dstLen) return false;
@@ -136,11 +138,74 @@ bool requestAuthorized(cJSON *doc) {
   return NetConfig::verifyPairing(jsonString(doc, "owner_id"), jsonString(doc, "pairing_secret"));
 }
 
+bool queryValue(httpd_req_t *req, const char *key, char *out, size_t outLen) {
+  if (!req || !key || !out || outLen == 0) return false;
+  out[0] = 0;
+  size_t queryLen = httpd_req_get_url_query_len(req) + 1;
+  if (queryLen <= 1) return false;
+  char *query = (char *)malloc(queryLen);
+  if (!query) return false;
+  bool ok = false;
+  if (httpd_req_get_url_query_str(req, query, queryLen) == ESP_OK &&
+      httpd_query_key_value(query, key, out, outLen) == ESP_OK) {
+    ok = true;
+  }
+  free(query);
+  return ok;
+}
+
+String queryString(httpd_req_t *req, const char *key, size_t maxLen = 128) {
+  if (maxLen < 2) maxLen = 2;
+  char *buf = (char *)malloc(maxLen);
+  if (!buf) return String("");
+  bool ok = queryValue(req, key, buf, maxLen);
+  String value = ok ? String(buf) : String("");
+  free(buf);
+  return value;
+}
+
+uint32_t queryUInt(httpd_req_t *req, const char *key, uint32_t fallback = 0) {
+  char buf[24] = {};
+  if (!queryValue(req, key, buf, sizeof(buf)) || !buf[0]) return fallback;
+  char *end = nullptr;
+  unsigned long value = strtoul(buf, &end, 10);
+  return end && *end == 0 ? (uint32_t)value : fallback;
+}
+
+bool requestAuthorizedQuery(httpd_req_t *req) {
+  if (!NetConfig::hasPairing()) return true;
+  String ownerId = queryString(req, "owner_id", 96);
+  String pairingSecret = queryString(req, "pairing_secret", 128);
+  return NetConfig::verifyPairing(ownerId, pairingSecret);
+}
+
 esp_err_t sendForbidden(httpd_req_t *req, const char *error) {
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "ok", false);
   cJSON_AddStringToObject(root, "error", error);
   httpd_resp_set_status(req, "403 Forbidden");
+  return sendJson(req, root);
+}
+
+esp_err_t sendBadRequestJson(httpd_req_t *req, const char *error) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", false);
+  cJSON_AddStringToObject(root, "error", error ? error : "bad request");
+  httpd_resp_set_status(req, "400 Bad Request");
+  return sendJson(req, root);
+}
+
+esp_err_t sendDisplaySyncError(httpd_req_t *req, const char *stage, const char *detail, uint32_t elapsedMs) {
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", false);
+  cJSON_AddStringToObject(root, "error", "display_sync_failed");
+  cJSON_AddStringToObject(root, "stage", stage ? stage : "unknown");
+  cJSON_AddStringToObject(root, "detail", detail ? detail : "C6 did not confirm transfer");
+  cJSON_AddBoolToObject(root, "c6_confirmed", false);
+  cJSON_AddNumberToObject(root, "transfer_ms", (double)elapsedMs);
+  cJSON_AddBoolToObject(root, "wifi_connected", WiFi.status() == WL_CONNECTED);
+  cJSON_AddNumberToObject(root, "wifi_rssi", (double)WiFi.RSSI());
+  httpd_resp_set_status(req, "502 Bad Gateway");
   return sendJson(req, root);
 }
 
@@ -747,6 +812,225 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
   return sendJson(req, root);
 }
 
+bool parseHexColor(const char *value, uint8_t &red, uint8_t &green, uint8_t &blue) {
+  if (!value || strlen(value) != 7 || value[0] != '#') return false;
+  char channel[3] = {0, 0, 0};
+  char *end = nullptr;
+  channel[0] = value[1]; channel[1] = value[2];
+  long parsedRed = strtol(channel, &end, 16);
+  if (!end || *end) return false;
+  channel[0] = value[3]; channel[1] = value[4];
+  long parsedGreen = strtol(channel, &end, 16);
+  if (!end || *end) return false;
+  channel[0] = value[5]; channel[1] = value[6];
+  long parsedBlue = strtol(channel, &end, 16);
+  if (!end || *end) return false;
+  red = (uint8_t)parsedRed;
+  green = (uint8_t)parsedGreen;
+  blue = (uint8_t)parsedBlue;
+  return true;
+}
+
+void applyEffectParams(const cJSON *params,
+                       String &direction,
+                       uint8_t &red,
+                       uint8_t &green,
+                       uint8_t &blue,
+                       uint8_t &secondaryRed,
+                       uint8_t &secondaryGreen,
+                       uint8_t &secondaryBlue,
+                       uint8_t &brightness,
+                       uint8_t &intensityPercent) {
+  if (!cJSON_IsObject(params)) return;
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(params, "direction");
+  if (cJSON_IsString(item) && item->valuestring) direction = item->valuestring;
+  item = cJSON_GetObjectItemCaseSensitive(params, "color");
+  if (cJSON_IsString(item) && item->valuestring) parseHexColor(item->valuestring, red, green, blue);
+  item = cJSON_GetObjectItemCaseSensitive(params, "secondary_color");
+  if (cJSON_IsString(item) && item->valuestring) {
+    parseHexColor(item->valuestring, secondaryRed, secondaryGreen, secondaryBlue);
+  }
+  item = cJSON_GetObjectItemCaseSensitive(params, "brightness");
+  if (cJSON_IsNumber(item)) brightness = (uint8_t)constrain(item->valueint, 1, 96);
+  item = cJSON_GetObjectItemCaseSensitive(params, "intensity");
+  if (cJSON_IsNumber(item)) intensityPercent = (uint8_t)constrain((int)(item->valuedouble * 100.0), 10, 100);
+}
+
+esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  size_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (internalFree < 64 * 1024 || largestBlock < 32 * 1024) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"expression_heap_guard\"}");
+  }
+
+  cJSON *doc = readJsonBody(req, ExpressionStore::kSingleLedBytes + 2048);
+  if (!doc) return sendBadRequestJson(req, "bad expression JSON");
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    return sendForbidden(req, "pairing_mismatch");
+  }
+
+  String eyeClipId = jsonString(doc, "eye_clip_id");
+  String ledEffectId = jsonString(doc, "led_effect_id");
+  String presetId = jsonString(doc, "preset_id");
+  String playback = jsonString(doc, "playback");
+  bool loopPlayback = playback == "loop";
+  const cJSON *durationItem = cJSON_GetObjectItemCaseSensitive(doc, "duration_ms");
+  uint32_t durationMs = cJSON_IsNumber(durationItem) ? (uint32_t)durationItem->valuedouble : 3000;
+  if (durationMs < 2500 || durationMs > 3500) {
+    cJSON_Delete(doc);
+    return sendBadRequestJson(req, "duration_ms must be 2500-3500");
+  }
+
+  const cJSON *modeItem = cJSON_GetObjectItemCaseSensitive(doc, "led_mode");
+  const cJSON *program = cJSON_GetObjectItemCaseSensitive(doc, "led_program");
+  const cJSON *params = cJSON_GetObjectItemCaseSensitive(doc, "led_params");
+  bool ledOk = true;
+  bool hasLed = ledEffectId.length() > 0;
+  if (cJSON_IsNumber(modeItem)) {
+    int mode = modeItem->valueint;
+    int safeBrightness = LedSerial::currentBrightness();
+    const cJSON *brightnessItem = cJSON_IsObject(params) ?
+        cJSON_GetObjectItemCaseSensitive(params, "brightness") : nullptr;
+    if (cJSON_IsNumber(brightnessItem)) safeBrightness = constrain(brightnessItem->valueint, 1, 96);
+    ledOk = LedSerial::setBrightness(safeBrightness) && mode >= 0 && mode <= LedSerial::maxMode() &&
+            LedSerial::setModeLocal(mode, loopPlayback, durationMs);
+  } else if (cJSON_IsObject(program) && hasLed) {
+    const cJSON *templateItem = cJSON_GetObjectItemCaseSensitive(program, "template");
+    const cJSON *variantItem = cJSON_GetObjectItemCaseSensitive(program, "variant");
+    const cJSON *defaults = cJSON_GetObjectItemCaseSensitive(program, "defaults");
+    String templateName = cJSON_IsString(templateItem) && templateItem->valuestring ? templateItem->valuestring : "";
+    String variant = cJSON_IsString(variantItem) && variantItem->valuestring ? variantItem->valuestring : "";
+    if (templateName != "mouth" && templateName != "arrow" && templateName != "heart" && templateName != "pulse") {
+      cJSON_Delete(doc);
+      return sendBadRequestJson(req, "unsupported LED template");
+    }
+    String direction = "right";
+    uint8_t red = 255, green = 255, blue = 255;
+    uint8_t secondaryRed = 255, secondaryGreen = 45, secondaryBlue = 125;
+    uint8_t brightness = (uint8_t)LedSerial::currentBrightness();
+    uint8_t intensityPercent = 100;
+    applyEffectParams(defaults, direction, red, green, blue,
+                      secondaryRed, secondaryGreen, secondaryBlue, brightness, intensityPercent);
+    applyEffectParams(params, direction, red, green, blue,
+                      secondaryRed, secondaryGreen, secondaryBlue, brightness, intensityPercent);
+    if (direction != "left" && direction != "right" && direction != "up" && direction != "down") {
+      cJSON_Delete(doc);
+      return sendBadRequestJson(req, "unsupported LED direction");
+    }
+
+    char *programJson = cJSON_PrintUnformatted(program);
+    if (!programJson || !ExpressionStore::saveLedEffect(ledEffectId.c_str(), programJson, strlen(programJson))) {
+      if (programJson) cJSON_free(programJson);
+      String error = ExpressionStore::lastError();
+      cJSON_Delete(doc);
+      return sendBadRequestJson(req, error.c_str());
+    }
+    cJSON_free(programJson);
+    LedSerial::EffectConfig config{
+        ledEffectId.c_str(), templateName.c_str(), variant.c_str(), direction.c_str(),
+        red, green, blue, secondaryRed, secondaryGreen, secondaryBlue,
+        brightness, intensityPercent, loopPlayback, durationMs};
+    ledOk = LedSerial::playEffect(config);
+  } else if (hasLed) {
+    int mode = LedSerial::resolveMode(ledEffectId.c_str());
+    int safeBrightness = LedSerial::currentBrightness();
+    const cJSON *brightnessItem = cJSON_IsObject(params) ?
+        cJSON_GetObjectItemCaseSensitive(params, "brightness") : nullptr;
+    if (cJSON_IsNumber(brightnessItem)) safeBrightness = constrain(brightnessItem->valueint, 1, 96);
+    ledOk = LedSerial::setBrightness(safeBrightness) && mode >= 0 &&
+            LedSerial::setModeLocal(mode, loopPlayback, durationMs);
+  } else {
+    ledOk = LedSerial::setModeLocal(0, true, 0);
+  }
+
+  if (!ledOk) {
+    cJSON_Delete(doc);
+    return sendBadRequestJson(req, "LED expression apply failed");
+  }
+
+  if (presetId.length()) {
+    cJSON *storedPreset = cJSON_CreateObject();
+    cJSON_AddStringToObject(storedPreset, "preset_id", presetId.c_str());
+    cJSON_AddStringToObject(storedPreset, "eye_clip_id", eyeClipId.c_str());
+    cJSON_AddStringToObject(storedPreset, "led_effect_id", ledEffectId.c_str());
+    cJSON_AddStringToObject(storedPreset, "playback", loopPlayback ? "loop" : "once");
+    cJSON_AddNumberToObject(storedPreset, "duration_ms", durationMs);
+    char *presetJson = cJSON_PrintUnformatted(storedPreset);
+    cJSON_Delete(storedPreset);
+    if (!presetJson || !ExpressionStore::savePreset(presetId.c_str(), presetJson, strlen(presetJson))) {
+      if (presetJson) cJSON_free(presetJson);
+      String error = ExpressionStore::lastError();
+      cJSON_Delete(doc);
+      return sendBadRequestJson(req, error.c_str());
+    }
+    cJSON_free(presetJson);
+  }
+
+  if (eyeClipId.length()) {
+    DisplayLink::sendClipPlay(eyeClipId.c_str(), loopPlayback);
+  }
+  cJSON_Delete(doc);
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddStringToObject(root, "eye_clip_id", eyeClipId.c_str());
+  cJSON_AddStringToObject(root, "led_effect_id", ledEffectId.c_str());
+  cJSON_AddStringToObject(root, "playback", loopPlayback ? "loop" : "once");
+  cJSON_AddNumberToObject(root, "duration_ms", durationMs);
+  cJSON_AddNumberToObject(root, "internal_free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  return sendJson(req, root);
+}
+
+esp_err_t deviceExpressionStopHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) return sendBadRequestJson(req, "bad JSON");
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  cJSON_Delete(doc);
+  bool ok = LedSerial::stopExpression(true);
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", ok);
+  cJSON_AddStringToObject(root, "action", "stop");
+  return sendJson(req, root);
+}
+
+esp_err_t deviceExpressionCapabilitiesHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  ExpressionStore::Capacity capacity = ExpressionStore::capacity();
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON *result = cJSON_AddObjectToObject(root, "result");
+  cJSON_AddNumberToObject(result, "spiffs_total_bytes", capacity.fsTotalBytes);
+  cJSON_AddNumberToObject(result, "spiffs_used_bytes", capacity.fsUsedBytes);
+  cJSON_AddNumberToObject(result, "spiffs_free_bytes", capacity.fsFreeBytes);
+  cJSON_AddNumberToObject(result, "spiffs_reserved_bytes", ExpressionStore::kFsReservedBytes);
+  cJSON_AddNumberToObject(result, "lcd_staging_max_bytes", ExpressionStore::kLcdStagingBytes);
+  cJSON_AddNumberToObject(result, "led_effect_used_bytes", capacity.ledUsedBytes);
+  cJSON_AddNumberToObject(result, "led_effect_budget_bytes", ExpressionStore::kLedBudgetBytes);
+  cJSON_AddNumberToObject(result, "led_effect_count", capacity.ledCount);
+  cJSON_AddNumberToObject(result, "led_effect_max_count", ExpressionStore::kMaxLedEffects);
+  cJSON_AddNumberToObject(result, "preset_used_bytes", capacity.presetUsedBytes);
+  cJSON_AddNumberToObject(result, "preset_budget_bytes", ExpressionStore::kPresetBudgetBytes);
+  cJSON_AddNumberToObject(result, "preset_count", capacity.presetCount);
+  cJSON_AddNumberToObject(result, "preset_max_count", ExpressionStore::kMaxPresets);
+  cJSON_AddNumberToObject(result, "c6_fs_total_bytes", DisplayLink::c6FsTotalBytes());
+  cJSON_AddNumberToObject(result, "c6_fs_used_bytes", DisplayLink::c6FsUsedBytes());
+  cJSON_AddNumberToObject(result, "c6_eye_installed_bytes", DisplayLink::c6InstalledBytes());
+  cJSON_AddNumberToObject(result, "c6_eye_installed_count", DisplayLink::c6InstalledCount());
+  cJSON_AddNumberToObject(result, "c6_eye_max_count", DisplayLink::c6MaxClipCount());
+  cJSON_AddNumberToObject(result, "c6_eye_budget_bytes", DisplayLink::c6InstalledBudgetBytes());
+  cJSON_AddNumberToObject(result, "internal_free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  cJSON_AddNumberToObject(result, "internal_largest_free_block",
+                          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  return sendJson(req, root);
+}
+
 esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
   setJsonHeaders(req);
 
@@ -764,6 +1048,7 @@ esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
   String action = jsonString(doc, "action");
   String clipId = jsonString(doc, "clip_id");
   bool ok = false;
+  String displayError;
 
   if (action == "begin") {
     String expression = jsonString(doc, "expression");
@@ -787,8 +1072,9 @@ esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
                                     durationMs,
                                     lcdBytes,
                                     lcdSha.c_str());
-    if (ok) {
-      DisplayLink::sendClipBegin(clipId.c_str(), fps, frameCount, durationMs, lcdBytes, lcdSha.c_str());
+    if (ok && !DisplayLink::sendClipBegin(clipId.c_str(), fps, frameCount, durationMs, lcdBytes, lcdSha.c_str())) {
+      ok = false;
+      displayError = DisplayLink::lastClipError();
     }
   } else if (action == "chunk") {
     String target = jsonString(doc, "target");
@@ -797,14 +1083,17 @@ esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(doc, "offset");
     if (cJSON_IsNumber(item)) offset = (size_t)item->valuedouble;
     ok = ExpressionClips::appendChunk(clipId.c_str(), target.c_str(), offset, data.c_str());
-    if (ok && target == "lcd") {
-      DisplayLink::sendClipChunk(clipId.c_str(), offset, data.c_str());
+    if (ok && target == "lcd" && !DisplayLink::sendClipChunk(clipId.c_str(), offset, data.c_str())) {
+      ok = false;
+      displayError = DisplayLink::lastClipError();
     }
   } else if (action == "commit") {
     ok = ExpressionClips::commitSync(clipId.c_str());
-    if (ok) {
-      DisplayLink::sendClipCommit(clipId.c_str());
+    if (ok && !DisplayLink::sendClipCommit(clipId.c_str())) {
+      ok = false;
+      displayError = DisplayLink::lastClipError();
     }
+    if (ok) ExpressionClips::releaseLcdPayload(clipId.c_str());
   } else if (action == "delete") {
     ok = ExpressionClips::removeClip(clipId.c_str());
   } else {
@@ -817,7 +1106,7 @@ esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
   if (!ok) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddBoolToObject(root, "ok", false);
-    cJSON_AddStringToObject(root, "error", ExpressionClips::lastError());
+    cJSON_AddStringToObject(root, "error", displayError.length() ? displayError.c_str() : ExpressionClips::lastError());
     httpd_resp_set_status(req, "400 Bad Request");
     return sendJson(req, root);
   }
@@ -826,6 +1115,129 @@ esp_err_t deviceExpressionClipSyncHandler(httpd_req_t *req) {
   cJSON_AddBoolToObject(root, "ok", true);
   cJSON_AddStringToObject(root, "clip_id", clipId.c_str());
   cJSON_AddStringToObject(root, "action", action.c_str());
+  return sendJson(req, root);
+}
+
+esp_err_t deviceExpressionClipUploadHandler(httpd_req_t *req) {
+  const uint32_t transferStartedMs = millis();
+  setJsonHeaders(req);
+  if (!requestAuthorizedQuery(req)) {
+    Serial.println("[device_api] /device/expression-clips/upload rejected: pairing_mismatch");
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  if (req->content_len <= 0) {
+    return sendBadRequestJson(req, "empty upload body");
+  }
+  if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 64 * 1024 ||
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32 * 1024) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"expression_heap_guard\"}");
+  }
+
+  String clipId = queryString(req, "clip_id", 48);
+  String expression = queryString(req, "expression", 48);
+  String lcdSha = queryString(req, "lcd_sha256", 72);
+  int fps = (int)queryUInt(req, "fps", 0);
+  int frameCount = (int)queryUInt(req, "frame_count", 0);
+  int durationMs = (int)queryUInt(req, "duration_ms", 0);
+  size_t lcdBytes = (size_t)queryUInt(req, "lcd_bytes", 0);
+
+  if (!clipId.length() || fps <= 0 || frameCount <= 0 || durationMs <= 0 || lcdBytes == 0 || !lcdSha.length()) {
+    return sendBadRequestJson(req, "missing clip metadata");
+  }
+  if ((size_t)req->content_len != lcdBytes) {
+    Serial.printf("[device_api] upload size mismatch clip=%s body=%d expected=%u\n",
+                  clipId.c_str(), req->content_len, (unsigned)lcdBytes);
+    return sendBadRequestJson(req, "upload size mismatch");
+  }
+  if (expression.length() == 0) {
+    expression = clipId;
+  }
+
+  if (!ExpressionClips::beginSync(clipId.c_str(),
+                                  expression.c_str(),
+                                  fps,
+                                  frameCount,
+                                  durationMs,
+                                  lcdBytes,
+                                  lcdSha.c_str())) {
+    return sendBadRequestJson(req, ExpressionClips::lastError());
+  }
+  bool displayOk = DisplayLink::sendClipBegin(clipId.c_str(), fps, frameCount, durationMs, lcdBytes, lcdSha.c_str());
+  String displayStage = displayOk ? String("") : String("begin");
+  String displayError = displayOk ? String("") : String(DisplayLink::lastClipError());
+
+  uint8_t buffer[1024];
+  size_t received = 0;
+  size_t uartChunks = 0;
+  constexpr size_t kDisplayChunkBytes = 256;
+  while (received < lcdBytes) {
+    size_t want = lcdBytes - received;
+    if (want > sizeof(buffer)) want = sizeof(buffer);
+    int read = httpd_req_recv(req, (char *)buffer, want);
+    if (read == HTTPD_SOCK_ERR_TIMEOUT) {
+      continue;
+    }
+    if (read <= 0) {
+      Serial.printf("[device_api] upload recv failed clip=%s received=%u expected=%u err=%d\n",
+                    clipId.c_str(), (unsigned)received, (unsigned)lcdBytes, read);
+      return sendBadRequestJson(req, "upload receive failed");
+    }
+
+    if (!ExpressionClips::appendBytes(clipId.c_str(), "lcd", received, buffer, (size_t)read)) {
+      Serial.printf("[device_api] upload append failed clip=%s offset=%u error=%s\n",
+                    clipId.c_str(), (unsigned)received, ExpressionClips::lastError());
+      return sendBadRequestJson(req, ExpressionClips::lastError());
+    }
+
+    if (displayOk) {
+      size_t relayed = 0;
+      while (relayed < (size_t)read) {
+        size_t part = (size_t)read - relayed;
+        if (part > kDisplayChunkBytes) part = kDisplayChunkBytes;
+        if (!DisplayLink::sendClipChunkBytes(clipId.c_str(), received + relayed, buffer + relayed, part)) {
+          displayOk = false;
+          displayStage = "chunk";
+          displayError = DisplayLink::lastClipError();
+          break;
+        }
+        relayed += part;
+        uartChunks++;
+      }
+    }
+    received += (size_t)read;
+  }
+
+  bool ok = ExpressionClips::commitSync(clipId.c_str());
+  if (!ok) {
+    return sendBadRequestJson(req, ExpressionClips::lastError());
+  }
+  if (displayOk && !DisplayLink::sendClipCommit(clipId.c_str(), received)) {
+    displayOk = false;
+    displayStage = "commit";
+    displayError = DisplayLink::lastClipError();
+  }
+  if (!displayOk) {
+    ExpressionClips::releaseLcdPayload(clipId.c_str());
+    Serial.printf("[device_api] C6 sync failed clip=%s stage=%s detail=%s\n",
+                  clipId.c_str(), displayStage.c_str(), displayError.c_str());
+    return sendDisplaySyncError(req, displayStage.c_str(), displayError.c_str(), millis() - transferStartedMs);
+  }
+  if (!ExpressionClips::releaseLcdPayload(clipId.c_str())) {
+    Serial.printf("[device_api] staging cleanup warning clip=%s error=%s\n",
+                  clipId.c_str(), ExpressionClips::lastError());
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddStringToObject(root, "clip_id", clipId.c_str());
+  cJSON_AddStringToObject(root, "action", "upload");
+  cJSON_AddNumberToObject(root, "bytes", (double)received);
+  cJSON_AddNumberToObject(root, "uart_chunks", (double)uartChunks);
+  cJSON_AddBoolToObject(root, "c6_confirmed", true);
+  cJSON_AddNumberToObject(root, "transfer_ms", (double)(millis() - transferStartedMs));
+  cJSON_AddBoolToObject(root, "wifi_connected", WiFi.status() == WL_CONNECTED);
+  cJSON_AddNumberToObject(root, "wifi_rssi", (double)WiFi.RSSI());
   return sendJson(req, root);
 }
 
@@ -1008,7 +1420,11 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/config", .method = HTTP_POST, .handler = deviceConfigPostHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_GET, .handler = deviceLedGetHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_POST, .handler = deviceLedPostHandler, .user_ctx = NULL},
+      {.uri = "/device/expressions/play", .method = HTTP_POST, .handler = deviceExpressionPlayHandler, .user_ctx = NULL},
+      {.uri = "/device/expressions/stop", .method = HTTP_POST, .handler = deviceExpressionStopHandler, .user_ctx = NULL},
+      {.uri = "/device/expression-capabilities", .method = HTTP_GET, .handler = deviceExpressionCapabilitiesHandler, .user_ctx = NULL},
       {.uri = "/device/expression-clips/sync", .method = HTTP_POST, .handler = deviceExpressionClipSyncHandler, .user_ctx = NULL},
+      {.uri = "/device/expression-clips/upload", .method = HTTP_POST, .handler = deviceExpressionClipUploadHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_POST, .handler = devicePairHandler, .user_ctx = NULL},
       {.uri = "/device/unpair", .method = HTTP_POST, .handler = deviceUnpairHandler, .user_ctx = NULL},
       {.uri = "/device/claim", .method = HTTP_POST, .handler = deviceClaimHandler, .user_ctx = NULL},
@@ -1019,7 +1435,11 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/debug/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/expressions/play", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/expressions/stop", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/expression-capabilities", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expression-clips/sync", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/expression-clips/upload", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/pair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/unpair", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/claim", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},

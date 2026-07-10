@@ -19,7 +19,9 @@ bool beginSync(const char *clipId,
                size_t lcdBytes,
                const char *lcdSha256);
 bool appendChunk(const char *clipId, const char *target, size_t offset, const char *hexData);
+bool appendBytes(const char *clipId, const char *target, size_t offset, const uint8_t *data, size_t len);
 bool commitSync(const char *clipId);
+bool releaseLcdPayload(const char *clipId);
 bool removeClip(const char *clipId);
 
 bool lcdPath(const char *clipId, char *out, size_t outLen);

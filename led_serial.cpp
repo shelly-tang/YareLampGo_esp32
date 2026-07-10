@@ -68,6 +68,18 @@ uint16_t g_clipFrameCount = 0;
 uint16_t g_clipFps = 0;
 uint32_t g_clipFrame = 0;
 uint32_t g_clipLastFrameMs = 0;
+char g_effectTemplate[16] = "";
+char g_effectVariant[16] = "";
+char g_effectDirection[8] = "right";
+uint8_t g_effectRed = 255;
+uint8_t g_effectGreen = 255;
+uint8_t g_effectBlue = 255;
+uint8_t g_effectSecondaryRed = 255;
+uint8_t g_effectSecondaryGreen = 45;
+uint8_t g_effectSecondaryBlue = 125;
+uint8_t g_effectIntensityPercent = 100;
+bool g_expressionLoop = true;
+uint32_t g_expressionEndMs = 0;
 
 bool g_focusEyesOpen = true;
 uint8_t g_focusBlinksRemaining = 0;
@@ -511,6 +523,18 @@ uint8_t scaledBrightness(uint8_t level) {
   return (uint8_t)((g_brightness * (uint16_t)level) / 255);
 }
 
+uint8_t effectChannel(uint8_t channel) {
+  uint32_t scaled = (uint32_t)channel * (uint32_t)g_brightness * (uint32_t)g_effectIntensityPercent;
+  return (uint8_t)(scaled / (255UL * 100UL));
+}
+
+uint32_t effectColor(bool secondary = false) {
+  return color(
+      effectChannel(secondary ? g_effectSecondaryRed : g_effectRed),
+      effectChannel(secondary ? g_effectSecondaryGreen : g_effectGreen),
+      effectChannel(secondary ? g_effectSecondaryBlue : g_effectBlue));
+}
+
 void setPhysicalPixel(int pixelIndex, uint32_t pixelColor) {
   if (pixelIndex < 0 || pixelIndex >= LAMPGO_LED_PIXEL_COUNT) return;
   int offset = pixelIndex * 3;
@@ -592,9 +616,17 @@ void releaseClipLocked() {
   g_clipFps = 0;
   g_clipFrame = 0;
   g_clipLastFrameMs = 0;
+  g_effectTemplate[0] = 0;
+  g_effectVariant[0] = 0;
+  snprintf(g_effectDirection, sizeof(g_effectDirection), "right");
+  g_expressionLoop = true;
+  g_expressionEndMs = 0;
 }
 
 bool showPixelsLocked();
+void renderRingFill(uint32_t pixelColor, uint32_t frame);
+void drawBitmap8Pair(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset = 0);
+void drawCombinedPattern(int patternIndex, uint32_t primaryColor, uint32_t secondaryColor = 0);
 
 void drawDizzyMouthLocked(uint32_t frameIndex) {
   int phase = (int)(frameIndex % 30);
@@ -603,10 +635,11 @@ void drawDizzyMouthLocked(uint32_t frameIndex) {
   int cy = 4;
   int halfW = 12 + (wave * 13) / 15;
   int halfH = 2 + (wave * 3) / 15;
-  uint32_t white = color(g_brightness, g_brightness, g_brightness);
+  bool customMouth = strcmp(g_effectTemplate, "mouth") == 0;
+  uint32_t white = customMouth ? effectColor(false) : color(g_brightness, g_brightness, g_brightness);
   uint32_t cyan = color(0, scaledBrightness(210), g_brightness);
   uint32_t blue = color(0, scaledBrightness(95), g_brightness);
-  uint32_t pink = color(g_brightness, scaledBrightness(45), scaledBrightness(125));
+  uint32_t pink = customMouth ? effectColor(true) : color(g_brightness, scaledBrightness(45), scaledBrightness(125));
   uint32_t deep = color(scaledBrightness(105), 0, scaledBrightness(45));
   uint32_t yellow = color(g_brightness, scaledBrightness(210), 0);
 
@@ -659,6 +692,56 @@ void drawGenericClipMarkerLocked(uint32_t frameIndex) {
 void renderClipFrameLocked(uint32_t frameIndex) {
   if (!g_clipActive || g_clipFrameCount == 0) return;
   clearPixels();
+  if (strcmp(g_effectTemplate, "mouth") == 0) {
+    if (strcmp(g_effectVariant, "flat") == 0) {
+      for (int col = 10; col <= 40; ++col) setCombinedPixel(4, col, effectColor(false));
+    } else if (strcmp(g_effectVariant, "smile") == 0) {
+      for (int col = 12; col <= 38; ++col) {
+        int distance = abs(col - 25);
+        int row = 3 + (distance * distance) / 190;
+        setCombinedPixel(row, col, effectColor(false));
+      }
+    } else if (strcmp(g_effectVariant, "dizzy") == 0) {
+      drawDizzyMouthLocked(frameIndex);
+    } else {
+      int pulse = 2 + (int)(frameIndex % 10 < 5 ? frameIndex % 5 : 9 - frameIndex % 10);
+      int halfW = 17 + pulse;
+      int halfH = 3 + pulse / 2;
+      for (int row = 0; row < kPanelRows; ++row) {
+        for (int col = 0; col < kCombinedCols; ++col) {
+          int dx = col - 25;
+          int dy = row - 4;
+          int outer = (dx * dx * 100) / (halfW * halfW) + (dy * dy * 100) / (halfH * halfH);
+          if (outer >= 48 && outer <= 115) setCombinedPixel(row, col, effectColor(false));
+        }
+      }
+    }
+    showPixelsLocked();
+    return;
+  }
+  if (strcmp(g_effectTemplate, "arrow") == 0) {
+    int pattern = 11;
+    if (strcmp(g_effectDirection, "left") == 0) pattern = 10;
+    else if (strcmp(g_effectDirection, "up") == 0) pattern = 12;
+    else if (strcmp(g_effectDirection, "down") == 0) pattern = 13;
+    drawCombinedPattern(pattern, effectColor(false));
+    showPixelsLocked();
+    return;
+  }
+  if (strcmp(g_effectTemplate, "heart") == 0) {
+    uint8_t pulse = (frameIndex % 10) < 5 ? 100 : 65;
+    uint8_t previousIntensity = g_effectIntensityPercent;
+    g_effectIntensityPercent = (uint8_t)((previousIntensity * pulse) / 100);
+    drawBitmap8Pair(kHeartPattern, effectColor(false));
+    g_effectIntensityPercent = previousIntensity;
+    showPixelsLocked();
+    return;
+  }
+  if (strcmp(g_effectTemplate, "pulse") == 0) {
+    renderRingFill(effectColor(false), frameIndex);
+    showPixelsLocked();
+    return;
+  }
   char key[32];
   normalizeKey(g_clipId, key, sizeof(key));
   if (strcmp(key, "dizzy") == 0) {
@@ -746,7 +829,7 @@ void drawBitmap8(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset 
   drawBitmap8OnMatrix(bitmap, pixelColor, 4, rowOffset);
 }
 
-void drawBitmap8Pair(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset = 0) {
+void drawBitmap8Pair(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset) {
   drawBitmap8PairCell(bitmap, pixelColor, 1, rowOffset);
   drawBitmap8PairCell(bitmap, pixelColor, 9, rowOffset);
 }
@@ -763,7 +846,7 @@ void drawBitmap8PairWithBottomDots(const uint8_t bitmap[8][8], uint32_t pixelCol
   fillLogicalCell(7, 12, pixelColor);
 }
 
-void drawCombinedPattern(int patternIndex, uint32_t primaryColor, uint32_t secondaryColor = 0) {
+void drawCombinedPattern(int patternIndex, uint32_t primaryColor, uint32_t secondaryColor) {
   clearPixels();
   if (patternIndex < 0 ||
       patternIndex >= (int)(sizeof(kCombinedPatterns) / sizeof(kCombinedPatterns[0]))) {
@@ -1119,7 +1202,12 @@ void ledTask(void *) {
       uint32_t now = millis();
       if (g_mutex && xSemaphoreTake(g_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
         bool shouldRender = false;
-        if (g_clipActive) {
+        if (!g_expressionLoop && g_expressionEndMs > 0 && (int32_t)(now - g_expressionEndMs) >= 0) {
+          releaseClipLocked();
+          g_mode = 0;
+          clearPixels();
+          showPixelsLocked();
+        } else if (g_clipActive) {
           uint32_t interval = g_clipFps > 0 ? (1000UL / g_clipFps) : 100;
           if (interval < 16) interval = 16;
           if (g_clipLastFrameMs == 0 || now - g_clipLastFrameMs >= interval) {
@@ -1200,6 +1288,14 @@ bool isReady() {
 }
 
 bool setMode(int mode) {
+  bool ok = setModeLocal(mode, true, 0);
+  if (ok) {
+    DisplayLink::sendExpression(modeName(mode));
+  }
+  return ok;
+}
+
+bool setModeLocal(int mode, bool loop, uint32_t durationMs) {
   if (!g_ready || mode < 0 || mode > kMaxMode || !takeLedLock()) {
     return false;
   }
@@ -1209,13 +1305,14 @@ bool setMode(int mode) {
   recordCommand(command);
   releaseClipLocked();
   g_mode = mode;
+  g_expressionLoop = loop;
+  g_expressionEndMs = !loop && durationMs > 0 ? millis() + durationMs : 0;
   resetAnimationStateLocked(millis());
   renderCurrentLocked();
   bool ok = g_lastShowOk;
   giveLedLock();
 
   Serial.printf("[led_matrix] mode=%d name=%s pin=%d\n", mode, modeName(mode), (int)LAMPGO_LED_PIXEL_PIN);
-  DisplayLink::sendExpression(modeName(mode));
   return ok;
 }
 
@@ -1261,6 +1358,8 @@ bool playClip(const char *clipId) {
   g_clipFps = 10;
   g_clipFrame = 0;
   g_clipLastFrameMs = millis();
+  g_expressionLoop = true;
+  g_expressionEndMs = 0;
   recordCommand("clip");
   renderClipFrameLocked(0);
   bool ok = g_lastShowOk;
@@ -1269,6 +1368,55 @@ bool playClip(const char *clipId) {
   Serial.printf("[led_matrix] procedural clip=%s frames=%u fps=%u\n",
                 clipId, (unsigned)g_clipFrameCount, (unsigned)g_clipFps);
   DisplayLink::sendClipPlay(clipId);
+  return ok;
+}
+
+bool playEffect(const EffectConfig &config) {
+  if (!g_ready || !config.effectId || !config.effectId[0] || !config.templateName || !config.templateName[0] ||
+      !takeLedLock()) {
+    return false;
+  }
+  if (strcmp(config.templateName, "mouth") != 0 && strcmp(config.templateName, "arrow") != 0 &&
+      strcmp(config.templateName, "heart") != 0 && strcmp(config.templateName, "pulse") != 0) {
+    giveLedLock();
+    return false;
+  }
+
+  releaseClipLocked();
+  snprintf(g_clipId, sizeof(g_clipId), "%s", config.effectId);
+  snprintf(g_effectTemplate, sizeof(g_effectTemplate), "%s", config.templateName);
+  snprintf(g_effectVariant, sizeof(g_effectVariant), "%s", config.variant ? config.variant : "");
+  snprintf(g_effectDirection, sizeof(g_effectDirection), "%s", config.direction ? config.direction : "right");
+  g_effectRed = config.red;
+  g_effectGreen = config.green;
+  g_effectBlue = config.blue;
+  g_effectSecondaryRed = config.secondaryRed;
+  g_effectSecondaryGreen = config.secondaryGreen;
+  g_effectSecondaryBlue = config.secondaryBlue;
+  g_effectIntensityPercent = config.intensityPercent < 10 ? 10 :
+                             (config.intensityPercent > 100 ? 100 : config.intensityPercent);
+  if (config.brightness >= 1) g_brightness = config.brightness;
+  g_clipActive = true;
+  g_clipFps = 10;
+  uint32_t durationMs = config.durationMs > 0 ? config.durationMs : 3000;
+  g_clipFrameCount = (uint16_t)max((uint32_t)1, durationMs / 100UL);
+  g_clipFrame = 0;
+  g_clipLastFrameMs = millis();
+  g_expressionLoop = config.loop;
+  g_expressionEndMs = config.loop ? 0 : millis() + durationMs;
+  recordCommand("effect");
+  renderClipFrameLocked(0);
+  bool ok = g_lastShowOk;
+  giveLedLock();
+
+  Serial.printf("[led_matrix] effect=%s template=%s loop=%d duration=%lu\n",
+                config.effectId, config.templateName, config.loop ? 1 : 0, (unsigned long)durationMs);
+  return ok;
+}
+
+bool stopExpression(bool syncDisplay) {
+  bool ok = setModeLocal(0, true, 0);
+  if (syncDisplay) DisplayLink::sendClipStop();
   return ok;
 }
 
