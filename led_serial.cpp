@@ -210,6 +210,16 @@ const uint8_t kHeartPattern[8][8] = {
     {0, 0, 0, 0, 0, 0, 0, 0},
 };
 
+// Compact 5x7 glyphs spell CODEX across the 51x9 irregular LED matrix.
+// Each row is stored as a five-bit bitmap, with the high bit on the left.
+const uint8_t kCodexGlyphRows[5][7] = {
+    {0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110},  // C
+    {0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110},  // O
+    {0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110},  // D
+    {0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111},  // E
+    {0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b01010, 0b10001},  // X
+};
+
 const uint8_t kCombinedPatterns[][8][16] = {
     {
         {0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0},
@@ -689,9 +699,59 @@ void drawGenericClipMarkerLocked(uint32_t frameIndex) {
   }
 }
 
+uint32_t dimColor(uint32_t pixelColor, uint8_t percent) {
+  uint8_t red = (uint8_t)((pixelColor >> 16) & 0xFF);
+  uint8_t green = (uint8_t)((pixelColor >> 8) & 0xFF);
+  uint8_t blue = (uint8_t)(pixelColor & 0xFF);
+  return color(
+      (uint8_t)((red * (uint16_t)percent) / 100),
+      (uint8_t)((green * (uint16_t)percent) / 100),
+      (uint8_t)((blue * (uint16_t)percent) / 100));
+}
+
+void drawCodexWordLocked(uint32_t frameIndex) {
+  clearPixels();
+
+  // Two deliberate black gaps make the whole word visibly blink. The short
+  // dim phase and cyan scan row give it a compact terminal/glitch character.
+  uint8_t phase = (uint8_t)(frameIndex % 20);
+  bool visible = phase < 6 || (phase >= 9 && phase < 16) || phase >= 18;
+  if (!visible) return;
+
+  uint8_t level = phase == 18 ? 35 : 100;
+  uint32_t primary = dimColor(effectColor(false), level);
+  uint32_t secondary = dimColor(effectColor(true), level);
+  int scanRow = (int)(frameIndex % 7);
+  constexpr int kStartCol = 7;
+  constexpr int kGlyphWidth = 5;
+  constexpr int kGlyphGap = 3;
+
+  for (int glyph = 0; glyph < 5; ++glyph) {
+    int glyphCol = kStartCol + glyph * (kGlyphWidth + kGlyphGap);
+    for (int row = 0; row < 7; ++row) {
+      uint8_t bits = kCodexGlyphRows[glyph][row];
+      for (int col = 0; col < kGlyphWidth; ++col) {
+        if (bits & (1U << (kGlyphWidth - 1 - col))) {
+          setCombinedPixel(row + 1, glyphCol + col, row == scanRow ? secondary : primary);
+        }
+      }
+    }
+  }
+
+  // A blinking cursor completes the command-line/Codex visual language.
+  if ((phase % 10) < 5) {
+    for (int row = 2; row <= 7; ++row) setCombinedPixel(row, 47, secondary);
+  }
+}
+
 void renderClipFrameLocked(uint32_t frameIndex) {
   if (!g_clipActive || g_clipFrameCount == 0) return;
   clearPixels();
+  if (strcmp(g_effectTemplate, "codex") == 0) {
+    drawCodexWordLocked(frameIndex);
+    showPixelsLocked();
+    return;
+  }
   if (strcmp(g_effectTemplate, "mouth") == 0) {
     if (strcmp(g_effectVariant, "flat") == 0) {
       for (int col = 10; col <= 40; ++col) setCombinedPixel(4, col, effectColor(false));
@@ -1377,7 +1437,8 @@ bool playEffect(const EffectConfig &config) {
     return false;
   }
   if (strcmp(config.templateName, "mouth") != 0 && strcmp(config.templateName, "arrow") != 0 &&
-      strcmp(config.templateName, "heart") != 0 && strcmp(config.templateName, "pulse") != 0) {
+      strcmp(config.templateName, "heart") != 0 && strcmp(config.templateName, "pulse") != 0 &&
+      strcmp(config.templateName, "codex") != 0) {
     giveLedLock();
     return false;
   }

@@ -903,7 +903,8 @@ esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
     const cJSON *defaults = cJSON_GetObjectItemCaseSensitive(program, "defaults");
     String templateName = cJSON_IsString(templateItem) && templateItem->valuestring ? templateItem->valuestring : "";
     String variant = cJSON_IsString(variantItem) && variantItem->valuestring ? variantItem->valuestring : "";
-    if (templateName != "mouth" && templateName != "arrow" && templateName != "heart" && templateName != "pulse") {
+    if (templateName != "mouth" && templateName != "arrow" && templateName != "heart" &&
+        templateName != "pulse" && templateName != "codex") {
       cJSON_Delete(doc);
       return sendBadRequestJson(req, "unsupported LED template");
     }
