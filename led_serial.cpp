@@ -3,6 +3,7 @@
 
 #include "led_serial.h"
 #include "display_link.h"
+#include "led_clip_player.h"
 
 #include <Arduino.h>
 #include <ctype.h>
@@ -27,6 +28,10 @@
 #endif
 
 #define LAMPGO_LED_PIXEL_COUNT (LAMPGO_LED_PANEL_PIXELS * LAMPGO_LED_PANEL_COUNT)
+
+#ifndef LAMPGO_LED_MAX_CHANNEL_SUM
+#define LAMPGO_LED_MAX_CHANNEL_SUM (LAMPGO_LED_PIXEL_COUNT * 64UL)
+#endif
 
 #ifndef LAMPGO_LED_TASK_STACK
 #define LAMPGO_LED_TASK_STACK 4096
@@ -63,6 +68,7 @@ uint8_t g_pixels[LAMPGO_LED_PIXEL_COUNT * 3] = {0};
 rmt_data_t *g_rmtData = nullptr;
 
 bool g_clipActive = false;
+bool g_storedClipActive = false;
 char g_clipId[40] = "";
 uint16_t g_clipFrameCount = 0;
 uint16_t g_clipFps = 0;
@@ -78,6 +84,7 @@ uint8_t g_effectSecondaryRed = 255;
 uint8_t g_effectSecondaryGreen = 45;
 uint8_t g_effectSecondaryBlue = 125;
 uint8_t g_effectIntensityPercent = 100;
+uint8_t g_storedPackedFrame[LedClipPlayer::kFrameBytes] = {};
 bool g_expressionLoop = true;
 uint32_t g_expressionEndMs = 0;
 
@@ -620,7 +627,9 @@ void clearPixels() {
 }
 
 void releaseClipLocked() {
+  LedClipPlayer::close();
   g_clipActive = false;
+  g_storedClipActive = false;
   g_clipId[0] = 0;
   g_clipFrameCount = 0;
   g_clipFps = 0;
@@ -744,8 +753,45 @@ void drawCodexWordLocked(uint32_t frameIndex) {
   }
 }
 
+void renderStoredClipFrameLocked(uint32_t frameIndex) {
+  clearPixels();
+  if (!LedClipPlayer::readTick((uint8_t)(frameIndex % LedClipPlayer::kTickCount),
+                               g_storedPackedFrame,
+                               sizeof(g_storedPackedFrame))) {
+    Serial.printf("[led_matrix] stored frame read failed: %s\n", LedClipPlayer::lastError());
+    return;
+  }
+
+  uint32_t channelSum = 0;
+  for (uint16_t pixel = 0; pixel < LedClipPlayer::kPixelCount; ++pixel) {
+    uint8_t paletteIndex = LedClipPlayer::paletteIndexAt(g_storedPackedFrame, pixel);
+    uint32_t raw = LedClipPlayer::paletteColor(paletteIndex);
+    uint8_t red = (uint8_t)((raw >> 16) & 0xFF);
+    uint8_t green = (uint8_t)((raw >> 8) & 0xFF);
+    uint8_t blue = (uint8_t)(raw & 0xFF);
+    red = (uint8_t)(((uint32_t)red * g_brightness * g_effectIntensityPercent) / (255UL * 100UL));
+    green = (uint8_t)(((uint32_t)green * g_brightness * g_effectIntensityPercent) / (255UL * 100UL));
+    blue = (uint8_t)(((uint32_t)blue * g_brightness * g_effectIntensityPercent) / (255UL * 100UL));
+    channelSum += red + green + blue;
+    setPhysicalPixel(pixel, color(red, green, blue));
+  }
+  if (channelSum > LAMPGO_LED_MAX_CHANNEL_SUM) {
+    for (uint16_t pixel = 0; pixel < LedClipPlayer::kPixelCount; ++pixel) {
+      int offset = pixel * 3;
+      g_pixels[offset + 0] = (uint8_t)(((uint32_t)g_pixels[offset + 0] * LAMPGO_LED_MAX_CHANNEL_SUM) / channelSum);
+      g_pixels[offset + 1] = (uint8_t)(((uint32_t)g_pixels[offset + 1] * LAMPGO_LED_MAX_CHANNEL_SUM) / channelSum);
+      g_pixels[offset + 2] = (uint8_t)(((uint32_t)g_pixels[offset + 2] * LAMPGO_LED_MAX_CHANNEL_SUM) / channelSum);
+    }
+  }
+  showPixelsLocked();
+}
+
 void renderClipFrameLocked(uint32_t frameIndex) {
   if (!g_clipActive || g_clipFrameCount == 0) return;
+  if (g_storedClipActive) {
+    renderStoredClipFrameLocked(frameIndex);
+    return;
+  }
   clearPixels();
   if (strcmp(g_effectTemplate, "codex") == 0) {
     drawCodexWordLocked(frameIndex);
@@ -1472,6 +1518,38 @@ bool playEffect(const EffectConfig &config) {
 
   Serial.printf("[led_matrix] effect=%s template=%s loop=%d duration=%lu\n",
                 config.effectId, config.templateName, config.loop ? 1 : 0, (unsigned long)durationMs);
+  return ok;
+}
+
+bool playStoredEffect(const StoredEffectConfig &config) {
+  if (!g_ready || !config.effectId || !config.effectId[0] || !takeLedLock()) return false;
+  releaseClipLocked();
+  if (!LedClipPlayer::open(config.effectId, config.colors)) {
+    Serial.printf("[led_matrix] stored effect open failed id=%s error=%s\n",
+                  config.effectId, LedClipPlayer::lastError());
+    giveLedLock();
+    return false;
+  }
+  snprintf(g_clipId, sizeof(g_clipId), "%s", config.effectId);
+  snprintf(g_effectTemplate, sizeof(g_effectTemplate), "pixel_clip");
+  g_effectIntensityPercent = config.intensityPercent < 10 ? 10 :
+                             (config.intensityPercent > 100 ? 100 : config.intensityPercent);
+  if (config.brightness >= 1) g_brightness = config.brightness > 96 ? 96 : config.brightness;
+  g_clipActive = true;
+  g_storedClipActive = true;
+  g_clipFps = LedClipPlayer::kFps;
+  g_clipFrameCount = LedClipPlayer::kTickCount;
+  g_clipFrame = 0;
+  g_clipLastFrameMs = millis();
+  uint32_t durationMs = config.durationMs > 0 ? config.durationMs : 3000;
+  g_expressionLoop = config.loop;
+  g_expressionEndMs = config.loop ? 0 : millis() + durationMs;
+  recordCommand("stored_effect");
+  renderStoredClipFrameLocked(0);
+  bool ok = g_lastShowOk;
+  giveLedLock();
+  Serial.printf("[led_matrix] stored effect=%s loop=%d bytes/frame=%u\n",
+                config.effectId, config.loop ? 1 : 0, (unsigned)LedClipPlayer::kFrameBytes);
   return ok;
 }
 

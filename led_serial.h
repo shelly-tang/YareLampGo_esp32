@@ -6,6 +6,8 @@
 
 #include <stdint.h>
 
+#include "led_clip_player.h"
+
 namespace LedSerial {
 
 struct EffectConfig {
@@ -25,6 +27,15 @@ struct EffectConfig {
   uint32_t durationMs;
 };
 
+struct StoredEffectConfig {
+  const char *effectId;
+  LedClipPlayer::Overrides colors;
+  uint8_t brightness;
+  uint8_t intensityPercent;
+  bool loop;
+  uint32_t durationMs;
+};
+
 bool begin();
 bool isReady();
 
@@ -34,6 +45,7 @@ bool setModeName(const char *name);
 bool setBrightness(int brightness);
 bool playClip(const char *clipId);
 bool playEffect(const EffectConfig &config);
+bool playStoredEffect(const StoredEffectConfig &config);
 bool stopExpression(bool syncDisplay = true);
 
 int resolveMode(const char *name);

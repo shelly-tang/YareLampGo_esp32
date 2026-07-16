@@ -21,7 +21,7 @@
 
 namespace {
 
-const char *FIRMWARE_VERSION = "lampgo-cam 0.4.0";
+const char *FIRMWARE_VERSION = "lampgo-cam 0.5.0";
 
 bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
   if (!dst || !used || !src || *used >= dstLen) return false;
@@ -856,6 +856,17 @@ void applyEffectParams(const cJSON *params,
   if (cJSON_IsNumber(item)) intensityPercent = (uint8_t)constrain((int)(item->valuedouble * 100.0), 10, 100);
 }
 
+LedClipPlayer::ColorOverride colorOverride(const cJSON *params, const char *key) {
+  LedClipPlayer::ColorOverride result{false, 0, 0, 0};
+  if (!cJSON_IsObject(params)) return result;
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(params, key);
+  if (cJSON_IsString(item) && item->valuestring &&
+      parseHexColor(item->valuestring, result.red, result.green, result.blue)) {
+    result.enabled = true;
+  }
+  return result;
+}
+
 esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
   setJsonHeaders(req);
   size_t internalFree = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -876,7 +887,7 @@ esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
   String ledEffectId = jsonString(doc, "led_effect_id");
   String presetId = jsonString(doc, "preset_id");
   String playback = jsonString(doc, "playback");
-  bool loopPlayback = playback == "loop";
+  bool loopPlayback = playback.length() == 0 || playback == "loop";
   const cJSON *durationItem = cJSON_GetObjectItemCaseSensitive(doc, "duration_ms");
   uint32_t durationMs = cJSON_IsNumber(durationItem) ? (uint32_t)durationItem->valuedouble : 3000;
   if (durationMs < 2500 || durationMs > 3500) {
@@ -922,19 +933,27 @@ esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
       return sendBadRequestJson(req, "unsupported LED direction");
     }
 
-    char *programJson = cJSON_PrintUnformatted(program);
-    if (!programJson || !ExpressionStore::saveLedEffect(ledEffectId.c_str(), programJson, strlen(programJson))) {
-      if (programJson) cJSON_free(programJson);
-      String error = ExpressionStore::lastError();
-      cJSON_Delete(doc);
-      return sendBadRequestJson(req, error.c_str());
-    }
-    cJSON_free(programJson);
     LedSerial::EffectConfig config{
         ledEffectId.c_str(), templateName.c_str(), variant.c_str(), direction.c_str(),
         red, green, blue, secondaryRed, secondaryGreen, secondaryBlue,
         brightness, intensityPercent, loopPlayback, durationMs};
     ledOk = LedSerial::playEffect(config);
+  } else if (hasLed && ExpressionStore::hasLedEffect(ledEffectId.c_str())) {
+    uint8_t brightness = (uint8_t)LedSerial::currentBrightness();
+    uint8_t intensityPercent = 100;
+    String unusedDirection = "right";
+    uint8_t unusedRed = 255, unusedGreen = 255, unusedBlue = 255;
+    uint8_t unusedSecondaryRed = 255, unusedSecondaryGreen = 255, unusedSecondaryBlue = 255;
+    applyEffectParams(params, unusedDirection, unusedRed, unusedGreen, unusedBlue,
+                      unusedSecondaryRed, unusedSecondaryGreen, unusedSecondaryBlue,
+                      brightness, intensityPercent);
+    LedClipPlayer::Overrides overrides{
+        colorOverride(params, "color"),
+        colorOverride(params, "secondary_color"),
+        colorOverride(params, "accent_color")};
+    LedSerial::StoredEffectConfig config{
+        ledEffectId.c_str(), overrides, brightness, intensityPercent, loopPlayback, durationMs};
+    ledOk = LedSerial::playStoredEffect(config);
   } else if (hasLed) {
     int mode = LedSerial::resolveMode(ledEffectId.c_str());
     int safeBrightness = LedSerial::currentBrightness();
@@ -982,6 +1001,98 @@ esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
   cJSON_AddStringToObject(root, "playback", loopPlayback ? "loop" : "once");
   cJSON_AddNumberToObject(root, "duration_ms", durationMs);
   cJSON_AddNumberToObject(root, "internal_free_heap", heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+  return sendJson(req, root);
+}
+
+esp_err_t deviceLedEffectsListHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  ExpressionStore::LedEffectInfo *items = (ExpressionStore::LedEffectInfo *)calloc(
+      ExpressionStore::kMaxLedEffects, sizeof(ExpressionStore::LedEffectInfo));
+  if (!items) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"allocation_failed\"}");
+  }
+  int count = ExpressionStore::listLedEffects(items, ExpressionStore::kMaxLedEffects);
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON *result = cJSON_AddObjectToObject(root, "result");
+  cJSON *effects = cJSON_AddArrayToObject(result, "led_effects");
+  for (int index = 0; index < count; ++index) {
+    cJSON *item = cJSON_CreateObject();
+    cJSON_AddStringToObject(item, "effect_id", items[index].effectId);
+    cJSON_AddNumberToObject(item, "bytes", (double)items[index].bytes);
+    cJSON_AddStringToObject(item, "sha256", items[index].sha256);
+    cJSON_AddItemToArray(effects, item);
+  }
+  free(items);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceLedEffectUploadHandler(httpd_req_t *req) {
+  const uint32_t startedMs = millis();
+  setJsonHeaders(req);
+  if (!requestAuthorizedQuery(req)) return sendForbidden(req, "pairing_mismatch");
+  String effectId = queryString(req, "effect_id", 48);
+  String sha256 = queryString(req, "sha256", 72);
+  uint32_t expectedBytes = queryUInt(req, "bytes", 0);
+  if (!effectId.length() || expectedBytes != (uint32_t)req->content_len) {
+    return sendBadRequestJson(req, "LED effect upload metadata mismatch");
+  }
+  if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 64 * 1024 ||
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) < 32 * 1024) {
+    httpd_resp_set_status(req, "503 Service Unavailable");
+    return httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"expression_heap_guard\"}");
+  }
+
+  LedSerial::stopExpression(false);
+  if (!ExpressionStore::beginLedEffectUpload(effectId.c_str(), expectedBytes, sha256.c_str())) {
+    return sendBadRequestJson(req, ExpressionStore::lastError());
+  }
+  uint8_t buffer[1024];
+  size_t received = 0;
+  while (received < expectedBytes) {
+    size_t want = expectedBytes - received;
+    if (want > sizeof(buffer)) want = sizeof(buffer);
+    int read = httpd_req_recv(req, (char *)buffer, want);
+    if (read == HTTPD_SOCK_ERR_TIMEOUT) continue;
+    if (read <= 0 || !ExpressionStore::appendLedEffectUpload(received, buffer, (size_t)read)) {
+      ExpressionStore::abortLedEffectUpload();
+      return sendBadRequestJson(req, read <= 0 ? "LED effect upload receive failed" : ExpressionStore::lastError());
+    }
+    received += (size_t)read;
+    delay(0);
+  }
+  if (!ExpressionStore::commitLedEffectUpload()) {
+    return sendBadRequestJson(req, ExpressionStore::lastError());
+  }
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddStringToObject(root, "effect_id", effectId.c_str());
+  cJSON_AddStringToObject(root, "action", "upload");
+  cJSON_AddNumberToObject(root, "bytes", (double)received);
+  cJSON_AddNumberToObject(root, "transfer_ms", (double)(millis() - startedMs));
+  return sendJson(req, root);
+}
+
+esp_err_t deviceLedEffectDeleteHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 1024);
+  if (!doc) return sendBadRequestJson(req, "bad JSON");
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  String effectId = jsonString(doc, "led_effect_id");
+  cJSON_Delete(doc);
+  if (!effectId.length()) return sendBadRequestJson(req, "led_effect_id required");
+  LedSerial::stopExpression(false);
+  if (!ExpressionStore::removeLedEffect(effectId.c_str())) {
+    return sendBadRequestJson(req, ExpressionStore::lastError());
+  }
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddStringToObject(root, "effect_id", effectId.c_str());
+  cJSON_AddStringToObject(root, "action", "delete");
   return sendJson(req, root);
 }
 
@@ -1423,6 +1534,9 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/led", .method = HTTP_POST, .handler = deviceLedPostHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/play", .method = HTTP_POST, .handler = deviceExpressionPlayHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/stop", .method = HTTP_POST, .handler = deviceExpressionStopHandler, .user_ctx = NULL},
+      {.uri = "/device/led-effects", .method = HTTP_GET, .handler = deviceLedEffectsListHandler, .user_ctx = NULL},
+      {.uri = "/device/led-effects/upload", .method = HTTP_POST, .handler = deviceLedEffectUploadHandler, .user_ctx = NULL},
+      {.uri = "/device/led-effects/delete", .method = HTTP_POST, .handler = deviceLedEffectDeleteHandler, .user_ctx = NULL},
       {.uri = "/device/expression-capabilities", .method = HTTP_GET, .handler = deviceExpressionCapabilitiesHandler, .user_ctx = NULL},
       {.uri = "/device/expression-clips/sync", .method = HTTP_POST, .handler = deviceExpressionClipSyncHandler, .user_ctx = NULL},
       {.uri = "/device/expression-clips/upload", .method = HTTP_POST, .handler = deviceExpressionClipUploadHandler, .user_ctx = NULL},
@@ -1438,6 +1552,9 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/play", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/stop", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/led-effects", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/led-effects/upload", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/led-effects/delete", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expression-capabilities", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expression-clips/sync", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expression-clips/upload", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},

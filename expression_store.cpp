@@ -6,13 +6,23 @@
 #include <Arduino.h>
 #include <SPIFFS.h>
 #include <ctype.h>
+#include <mbedtls/sha256.h>
 #include <string.h>
+
+#include "led_clip_player.h"
 
 namespace ExpressionStore {
 namespace {
 
 bool g_ready = false;
 char g_lastError[96] = "";
+File g_ledUploadFile;
+char g_ledUploadId[40] = "";
+char g_ledUploadTemporary[80] = "";
+char g_ledUploadFinal[80] = "";
+char g_ledUploadSha256[65] = "";
+size_t g_ledUploadExpected = 0;
+size_t g_ledUploadWritten = 0;
 
 void setError(const char *message) {
   snprintf(g_lastError, sizeof(g_lastError), "%s", message ? message : "unknown");
@@ -59,12 +69,78 @@ void scanPrefix(const char *prefix, size_t &bytes, int &count) {
     const char *prefixWithoutSlash = prefix && prefix[0] == '/' ? prefix + 1 : prefix;
     bool matches = normalized ? strstr(normalized, prefix) == normalized :
                    (name && prefixWithoutSlash && strstr(name, prefixWithoutSlash) == name);
-    if (matches) {
+    bool temporary = name && (strstr(name, ".tmp") || strstr(name, ".bak"));
+    if (matches && !temporary) {
       bytes += file.size();
       count++;
     }
     file = root.openNextFile();
   }
+}
+
+bool fileSha256Hex(const char *path, char *out, size_t outLen) {
+  if (!path || !out || outLen < 65) {
+    setError("sha output too small");
+    return false;
+  }
+  File file = SPIFFS.open(path, "r");
+  if (!file) {
+    setError("LED effect file missing");
+    return false;
+  }
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  if (mbedtls_sha256_starts(&ctx, 0) != 0) {
+    file.close();
+    mbedtls_sha256_free(&ctx);
+    setError("sha init failed");
+    return false;
+  }
+  uint8_t buffer[256];
+  while (file.available()) {
+    int read = file.read(buffer, sizeof(buffer));
+    if (read < 0 || (read > 0 && mbedtls_sha256_update(&ctx, buffer, (size_t)read) != 0)) {
+      file.close();
+      mbedtls_sha256_free(&ctx);
+      setError("sha read failed");
+      return false;
+    }
+  }
+  file.close();
+  uint8_t digest[32];
+  if (mbedtls_sha256_finish(&ctx, digest) != 0) {
+    mbedtls_sha256_free(&ctx);
+    setError("sha finish failed");
+    return false;
+  }
+  mbedtls_sha256_free(&ctx);
+  static const char *hex = "0123456789abcdef";
+  for (int index = 0; index < 32; ++index) {
+    out[index * 2] = hex[digest[index] >> 4];
+    out[index * 2 + 1] = hex[digest[index] & 0x0F];
+  }
+  out[64] = 0;
+  return true;
+}
+
+bool equalsIgnoreCase(const char *left, const char *right) {
+  if (!left || !right) return false;
+  while (*left && *right) {
+    if (tolower((unsigned char)*left) != tolower((unsigned char)*right)) return false;
+    ++left;
+    ++right;
+  }
+  return *left == 0 && *right == 0;
+}
+
+void clearLedUpload() {
+  if (g_ledUploadFile) g_ledUploadFile.close();
+  g_ledUploadId[0] = 0;
+  g_ledUploadTemporary[0] = 0;
+  g_ledUploadFinal[0] = 0;
+  g_ledUploadSha256[0] = 0;
+  g_ledUploadExpected = 0;
+  g_ledUploadWritten = 0;
 }
 
 bool atomicWrite(const char *path, const char *json, size_t len) {
@@ -181,6 +257,188 @@ bool canStageLcd(size_t bytes) {
 
 bool saveLedEffect(const char *effectId, const char *json, size_t len) {
   return saveAsset("le", effectId, json, len, kSingleLedBytes, kLedBudgetBytes, kMaxLedEffects);
+}
+
+bool ledEffectPath(const char *effectId, char *out, size_t outLen) {
+  return buildPath("le", effectId, "lef", out, outLen);
+}
+
+bool beginLedEffectUpload(const char *effectId, size_t expectedBytes, const char *expectedSha256) {
+  if (!begin()) return false;
+  abortLedEffectUpload();
+  if (expectedBytes < LedClipPlayer::kHeaderBytes || expectedBytes > kSingleLedBytes ||
+      !expectedSha256 || strlen(expectedSha256) != 64) {
+    setError("invalid LED effect upload metadata");
+    return false;
+  }
+  if (!sanitizeId(effectId, g_ledUploadId, sizeof(g_ledUploadId)) ||
+      !ledEffectPath(g_ledUploadId, g_ledUploadFinal, sizeof(g_ledUploadFinal))) {
+    clearLedUpload();
+    return false;
+  }
+  snprintf(g_ledUploadTemporary, sizeof(g_ledUploadTemporary), "%s.tmp", g_ledUploadFinal);
+
+  Capacity current = capacity();
+  File existing = SPIFFS.open(g_ledUploadFinal, "r");
+  size_t existingSize = existing ? existing.size() : 0;
+  bool exists = (bool)existing;
+  if (existing) existing.close();
+  char legacyPath[72];
+  if (buildPath("le", g_ledUploadId, "json", legacyPath, sizeof(legacyPath))) {
+    File legacy = SPIFFS.open(legacyPath, "r");
+    if (legacy) {
+      existingSize += legacy.size();
+      exists = true;
+      legacy.close();
+    }
+  }
+  if (!exists && current.ledCount >= kMaxLedEffects) {
+    clearLedUpload();
+    setError("asset count budget reached");
+    return false;
+  }
+  if (current.ledUsedBytes - existingSize + expectedBytes > kLedBudgetBytes) {
+    clearLedUpload();
+    setError("asset byte budget reached");
+    return false;
+  }
+  if (current.fsFreeBytes < expectedBytes + kFsReservedBytes) {
+    clearLedUpload();
+    setError("filesystem safety reserve would be crossed");
+    return false;
+  }
+  SPIFFS.remove(g_ledUploadTemporary);
+  g_ledUploadFile = SPIFFS.open(g_ledUploadTemporary, "w");
+  if (!g_ledUploadFile) {
+    clearLedUpload();
+    setError("LED effect temporary open failed");
+    return false;
+  }
+  g_ledUploadExpected = expectedBytes;
+  snprintf(g_ledUploadSha256, sizeof(g_ledUploadSha256), "%s", expectedSha256);
+  g_lastError[0] = 0;
+  return true;
+}
+
+bool appendLedEffectUpload(size_t offset, const uint8_t *data, size_t len) {
+  if (!g_ledUploadFile || !data || len == 0 || offset != g_ledUploadWritten ||
+      g_ledUploadWritten + len > g_ledUploadExpected) {
+    setError("LED effect upload offset mismatch");
+    return false;
+  }
+  if (g_ledUploadFile.write(data, len) != len) {
+    setError("LED effect upload write failed");
+    return false;
+  }
+  g_ledUploadWritten += len;
+  return true;
+}
+
+bool commitLedEffectUpload() {
+  if (!g_ledUploadFile || g_ledUploadWritten != g_ledUploadExpected) {
+    setError("LED effect upload is incomplete");
+    abortLedEffectUpload();
+    return false;
+  }
+  g_ledUploadFile.flush();
+  g_ledUploadFile.close();
+  char actualSha256[65];
+  if (!fileSha256Hex(g_ledUploadTemporary, actualSha256, sizeof(actualSha256))) {
+    SPIFFS.remove(g_ledUploadTemporary);
+    clearLedUpload();
+    return false;
+  }
+  if (!equalsIgnoreCase(actualSha256, g_ledUploadSha256)) {
+    setError("LED effect SHA256 mismatch");
+    SPIFFS.remove(g_ledUploadTemporary);
+    clearLedUpload();
+    return false;
+  }
+  if (!LedClipPlayer::validatePath(g_ledUploadTemporary)) {
+    setError(LedClipPlayer::lastError());
+    SPIFFS.remove(g_ledUploadTemporary);
+    clearLedUpload();
+    return false;
+  }
+
+  char backup[88];
+  snprintf(backup, sizeof(backup), "%s.bak", g_ledUploadFinal);
+  SPIFFS.remove(backup);
+  bool hadPrevious = SPIFFS.exists(g_ledUploadFinal);
+  if (hadPrevious && !SPIFFS.rename(g_ledUploadFinal, backup)) {
+    SPIFFS.remove(g_ledUploadTemporary);
+    clearLedUpload();
+    setError("LED effect backup failed");
+    return false;
+  }
+  if (!SPIFFS.rename(g_ledUploadTemporary, g_ledUploadFinal)) {
+    if (hadPrevious) SPIFFS.rename(backup, g_ledUploadFinal);
+    SPIFFS.remove(g_ledUploadTemporary);
+    clearLedUpload();
+    setError("LED effect commit failed");
+    return false;
+  }
+  SPIFFS.remove(backup);
+  char legacy[72];
+  if (buildPath("le", g_ledUploadId, "json", legacy, sizeof(legacy))) SPIFFS.remove(legacy);
+  clearLedUpload();
+  g_lastError[0] = 0;
+  return true;
+}
+
+void abortLedEffectUpload() {
+  if (g_ledUploadFile) g_ledUploadFile.close();
+  if (g_ledUploadTemporary[0]) SPIFFS.remove(g_ledUploadTemporary);
+  clearLedUpload();
+}
+
+bool removeLedEffect(const char *effectId) {
+  if (!begin()) return false;
+  char lef[72];
+  char json[72];
+  if (!ledEffectPath(effectId, lef, sizeof(lef)) || !buildPath("le", effectId, "json", json, sizeof(json))) {
+    return false;
+  }
+  bool existed = SPIFFS.exists(lef) || SPIFFS.exists(json);
+  bool ok = (!SPIFFS.exists(lef) || SPIFFS.remove(lef)) &&
+            (!SPIFFS.exists(json) || SPIFFS.remove(json));
+  if (!existed) setError("LED effect not found");
+  else if (!ok) setError("LED effect delete failed");
+  else g_lastError[0] = 0;
+  return existed && ok;
+}
+
+bool hasLedEffect(const char *effectId) {
+  if (!begin()) return false;
+  char path[72];
+  return ledEffectPath(effectId, path, sizeof(path)) && SPIFFS.exists(path);
+}
+
+int listLedEffects(LedEffectInfo *out, int maxCount) {
+  if (!begin() || !out || maxCount <= 0) return 0;
+  int count = 0;
+  File root = SPIFFS.open("/");
+  if (!root || !root.isDirectory()) return 0;
+  File file = root.openNextFile();
+  while (file && count < maxCount) {
+    String name = file.name();
+    int start = name.startsWith("/") ? 1 : 0;
+    if (name.startsWith("le_", start) && name.endsWith(".lef")) {
+      String id = name.substring(start + 3, name.length() - 4);
+      snprintf(out[count].effectId, sizeof(out[count].effectId), "%s", id.c_str());
+      out[count].bytes = file.size();
+      file.close();
+      char path[72];
+      if (ledEffectPath(out[count].effectId, path, sizeof(path)) &&
+          fileSha256Hex(path, out[count].sha256, sizeof(out[count].sha256))) {
+        count++;
+      }
+      file = root.openNextFile();
+      continue;
+    }
+    file = root.openNextFile();
+  }
+  return count;
 }
 
 bool savePreset(const char *presetId, const char *json, size_t len) {

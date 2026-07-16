@@ -4,6 +4,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 namespace ExpressionStore {
 
@@ -17,10 +18,24 @@ struct Capacity {
   int presetCount;
 };
 
+struct LedEffectInfo {
+  char effectId[40];
+  char sha256[65];
+  size_t bytes;
+};
+
 bool begin();
 const char *lastError();
 bool canStageLcd(size_t bytes);
 bool saveLedEffect(const char *effectId, const char *json, size_t len);
+bool beginLedEffectUpload(const char *effectId, size_t expectedBytes, const char *expectedSha256);
+bool appendLedEffectUpload(size_t offset, const uint8_t *data, size_t len);
+bool commitLedEffectUpload();
+void abortLedEffectUpload();
+bool removeLedEffect(const char *effectId);
+bool hasLedEffect(const char *effectId);
+bool ledEffectPath(const char *effectId, char *out, size_t outLen);
+int listLedEffects(LedEffectInfo *out, int maxCount);
 bool savePreset(const char *presetId, const char *json, size_t len);
 Capacity capacity();
 
