@@ -10,6 +10,7 @@
 #include <esp_heap_caps.h>
 #include <esp32-hal-rmt.h>
 #include <esp_system.h>
+#include <math.h>
 #include <string.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
@@ -96,6 +97,36 @@ uint8_t g_clockGreen = 214;
 uint8_t g_clockBlue = 255;
 char g_clockEffect[8] = "steady";
 uint32_t g_clockLastFrameMs = 0;
+
+constexpr uint32_t kOceanFrameIntervalMs = 50;
+constexpr uint32_t kOceanInputTimeoutMs = 1000;
+volatile bool g_oceanActive = false;
+uint8_t g_oceanRed = 0;
+uint8_t g_oceanGreen = 184;
+uint8_t g_oceanBlue = 224;
+uint8_t g_oceanFillPercent = 55;
+uint8_t g_oceanSensitivityPercent = 100;
+uint8_t g_oceanEdgeHighlightPercent = 75;
+uint8_t g_oceanTiltPercent = 100;
+uint8_t g_oceanImpactPercent = 100;
+uint8_t g_oceanDampingPercent = 130;
+uint32_t g_oceanLastFrameMs = 0;
+float g_oceanHeight[kCombinedCols] = {};
+float g_oceanVelocity[kCombinedCols] = {};
+float g_oceanNextHeight[kCombinedCols] = {};
+float g_oceanFilteredAngle = 0.0f;
+float g_oceanBulkTilt = 0.0f;
+float g_oceanBulkVelocity = 0.0f;
+float g_oceanPreviousInputVelocity = 0.0f;
+float g_oceanLeftImpactEnergy = 0.0f;
+float g_oceanRightImpactEnergy = 0.0f;
+bool g_oceanLeftContact = false;
+bool g_oceanRightContact = false;
+portMUX_TYPE g_oceanInputMux = portMUX_INITIALIZER_UNLOCKED;
+volatile float g_oceanInputAngleDeg = 0.0f;
+volatile float g_oceanInputAngularVelocityDps = 0.0f;
+volatile uint32_t g_oceanInputSequence = 0;
+volatile uint32_t g_oceanInputAtMs = 0;
 
 bool g_focusEyesOpen = true;
 uint8_t g_focusBlinksRemaining = 0;
@@ -650,6 +681,8 @@ void releaseClipLocked() {
   g_expressionLoop = true;
   g_expressionEndMs = 0;
   g_clockActive = false;
+  g_oceanActive = false;
+  g_oceanLastFrameMs = 0;
 }
 
 bool showPixelsLocked();
@@ -724,6 +757,191 @@ void renderClockLocked(uint32_t now) {
     drawClockDigit(g_clockMinute % 10, 35, primary);
   }
   if (strcmp(g_clockEffect, "orbit") == 0) renderClockOrbit(now);
+  showPixelsLocked();
+}
+
+uint8_t oceanChannel(uint8_t channel, float scale) {
+  float value = channel * ((float)g_brightness / 255.0f) * scale;
+  if (value < 0.0f) value = 0.0f;
+  if (value > 255.0f) value = 255.0f;
+  return (uint8_t)(value + 0.5f);
+}
+
+void constrainOceanPowerLocked() {
+  uint32_t channelSum = 0;
+  for (size_t offset = 0; offset < sizeof(g_pixels); ++offset) channelSum += g_pixels[offset];
+  if (channelSum <= LAMPGO_LED_MAX_CHANNEL_SUM) return;
+  for (size_t offset = 0; offset < sizeof(g_pixels); ++offset) {
+    g_pixels[offset] = (uint8_t)(((uint32_t)g_pixels[offset] * LAMPGO_LED_MAX_CHANNEL_SUM) / channelSum);
+  }
+}
+
+void stepOceanLocked(uint32_t now) {
+  float inputAngle = 0.0f;
+  float inputVelocity = 0.0f;
+  uint32_t inputAt = 0;
+  portENTER_CRITICAL(&g_oceanInputMux);
+  inputAngle = g_oceanInputAngleDeg;
+  inputVelocity = g_oceanInputAngularVelocityDps;
+  inputAt = g_oceanInputAtMs;
+  portEXIT_CRITICAL(&g_oceanInputMux);
+
+  bool inputFresh = inputAt != 0 && now - inputAt <= kOceanInputTimeoutMs;
+  if (!inputFresh) {
+    inputAngle = 0.0f;
+    inputVelocity = 0.0f;
+  }
+  inputAngle = fmaxf(-35.0f, fminf(35.0f, inputAngle));
+  inputVelocity = fmaxf(-180.0f, fminf(180.0f, inputVelocity));
+  g_oceanFilteredAngle += (inputAngle - g_oceanFilteredAngle) * 0.22f;
+
+  constexpr float dt = 0.05f;
+  float sensitivity = (float)g_oceanSensitivityPercent / 100.0f;
+  float tiltScale = (float)g_oceanTiltPercent / 100.0f;
+  float impactScale = (float)g_oceanImpactPercent / 100.0f;
+  float dampingScale = (float)g_oceanDampingPercent / 100.0f;
+  float baseHeight = 1.2f + 6.3f * ((float)g_oceanFillPercent / 100.0f);
+  float angularAcceleration = inputFresh ? (inputVelocity - g_oceanPreviousInputVelocity) / dt : 0.0f;
+  angularAcceleration = fmaxf(-900.0f, fminf(900.0f, angularAcceleration));
+  g_oceanPreviousInputVelocity = inputFresh ? inputVelocity : 0.0f;
+
+  float targetBulkTilt = sinf(g_oceanFilteredAngle * 3.14159265f / 180.0f)
+      * 9.5f * sensitivity * tiltScale;
+  targetBulkTilt = fmaxf(-4.25f, fminf(4.25f, targetBulkTilt));
+  float bulkAcceleration = 11.0f * (targetBulkTilt - g_oceanBulkTilt)
+      - 1.5f * dampingScale * g_oceanBulkVelocity - 0.018f * angularAcceleration * impactScale;
+  g_oceanBulkVelocity += bulkAcceleration * dt;
+  g_oceanBulkVelocity = fmaxf(-12.0f, fminf(12.0f, g_oceanBulkVelocity));
+  g_oceanBulkTilt += g_oceanBulkVelocity * dt;
+  if (g_oceanBulkTilt < -4.45f || g_oceanBulkTilt > 4.45f) {
+    g_oceanBulkTilt = fmaxf(-4.45f, fminf(4.45f, g_oceanBulkTilt));
+    g_oceanBulkVelocity *= -0.35f;
+  }
+
+  bool idle = fabsf(inputVelocity) < 2.0f && fabsf(inputAngle - g_oceanFilteredAngle) < 0.6f;
+  float meanBefore = 0.0f;
+  for (int col = 0; col < kCombinedCols; ++col) meanBefore += g_oceanHeight[col];
+  meanBefore /= kCombinedCols;
+
+  for (int col = 0; col < kCombinedCols; ++col) {
+    int left = col > 0 ? col - 1 : 1;
+    int right = col + 1 < kCombinedCols ? col + 1 : kCombinedCols - 2;
+    float x = ((float)col / (kCombinedCols - 1)) * 2.0f - 1.0f;
+    float equilibrium = baseHeight + g_oceanBulkTilt * x;
+    float laplacian = g_oceanHeight[left] - 2.0f * g_oceanHeight[col] + g_oceanHeight[right];
+    float idleForce = idle ? 0.18f * sinf(now * 0.0015f + col * 0.31f) : 0.0f;
+    float acceleration = 14.0f * laplacian + 3.0f * (equilibrium - g_oceanHeight[col])
+        - 1.5f * dampingScale * g_oceanVelocity[col] + idleForce;
+    g_oceanVelocity[col] += acceleration * dt;
+    g_oceanNextHeight[col] = g_oceanHeight[col] + g_oceanVelocity[col] * dt;
+  }
+
+  float meanAfter = 0.0f;
+  for (int col = 0; col < kCombinedCols; ++col) meanAfter += g_oceanNextHeight[col];
+  meanAfter /= kCombinedCols;
+  float volumeCorrection = meanBefore - meanAfter;
+  float leftPenetration = 0.0f;
+  float rightPenetration = 0.0f;
+  for (int col = 0; col < kCombinedCols; ++col) {
+    float height = g_oceanNextHeight[col] + volumeCorrection;
+    if (col < 6) leftPenetration = fmaxf(leftPenetration, height - 8.05f);
+    if (col >= kCombinedCols - 6) rightPenetration = fmaxf(rightPenetration, height - 8.05f);
+    if (height < 0.35f) {
+      height = 0.35f;
+      g_oceanVelocity[col] *= -0.45f;
+    } else if (height > 8.65f) {
+      height = 8.65f;
+      g_oceanVelocity[col] *= -0.55f;
+    }
+    g_oceanHeight[col] = height;
+  }
+
+  bool leftContact = leftPenetration > 0.0f;
+  bool rightContact = rightPenetration > 0.0f;
+  if (leftContact && !g_oceanLeftContact) {
+    float energy = fminf(1.0f, (leftPenetration * 1.7f + fabsf(g_oceanVelocity[1]) * 0.16f) * impactScale);
+    g_oceanLeftImpactEnergy = fmaxf(g_oceanLeftImpactEnergy, energy);
+    for (int col = 0; col < 12; ++col) {
+      float weight = 1.0f - (float)col / 12.0f;
+      if (g_oceanVelocity[col] > 0.0f) g_oceanVelocity[col] *= -0.55f;
+      g_oceanVelocity[col] -= energy * 4.8f * weight;
+    }
+    g_oceanBulkVelocity += energy * 1.8f;
+  }
+  if (rightContact && !g_oceanRightContact) {
+    float energy = fminf(
+        1.0f, (rightPenetration * 1.7f + fabsf(g_oceanVelocity[kCombinedCols - 2]) * 0.16f) * impactScale);
+    g_oceanRightImpactEnergy = fmaxf(g_oceanRightImpactEnergy, energy);
+    for (int col = kCombinedCols - 12; col < kCombinedCols; ++col) {
+      float weight = (float)(col - (kCombinedCols - 12)) / 12.0f;
+      if (g_oceanVelocity[col] > 0.0f) g_oceanVelocity[col] *= -0.55f;
+      g_oceanVelocity[col] -= energy * 4.8f * weight;
+    }
+    g_oceanBulkVelocity -= energy * 1.8f;
+  }
+  g_oceanLeftContact = leftContact;
+  g_oceanRightContact = rightContact;
+  g_oceanLeftImpactEnergy *= 0.82f;
+  g_oceanRightImpactEnergy *= 0.82f;
+}
+
+void renderOceanLocked(uint32_t now) {
+  stepOceanLocked(now);
+  clearPixels();
+  float edgeMixBase = (float)g_oceanEdgeHighlightPercent / 100.0f;
+  for (int col = 0; col < kCombinedCols; ++col) {
+    float surface = kPanelRows - g_oceanHeight[col];
+    float left = g_oceanHeight[col > 0 ? col - 1 : col];
+    float right = g_oceanHeight[col + 1 < kCombinedCols ? col + 1 : col];
+    float leftImpact = col < 12 ? g_oceanLeftImpactEnergy * (1.0f - (float)col / 12.0f) : 0.0f;
+    float rightImpact = col >= kCombinedCols - 12
+        ? g_oceanRightImpactEnergy * ((float)(col - (kCombinedCols - 12)) / 12.0f) : 0.0f;
+    float impact = fmaxf(leftImpact, rightImpact);
+    float activity = fminf(
+        1.0f, fabsf(right - left) * 0.32f + fabsf(g_oceanVelocity[col]) * 0.18f + impact);
+    int edgeRow = (int)floorf(surface + 0.5f);
+    for (int row = 0; row < kPanelRows; ++row) {
+      float coverage = (row + 1.0f) - surface;
+      if (coverage <= 0.0f) continue;
+      if (coverage > 1.0f) coverage = 1.0f;
+      float depth = fminf(1.0f, ((row + 0.5f) - surface) / 4.0f);
+      float level = coverage * (0.42f + depth * 0.48f);
+      setCombinedPixel(row, col, color(
+          oceanChannel(g_oceanRed, level),
+          oceanChannel(g_oceanGreen, level),
+          oceanChannel(g_oceanBlue, level)));
+    }
+    if (edgeRow >= 0 && edgeRow < kPanelRows) {
+      float edgeMix = fminf(1.0f, edgeMixBase * (0.55f + activity * 0.75f));
+      float glow = 0.65f + activity * 0.55f;
+      uint8_t r = oceanChannel((uint8_t)(g_oceanRed + (255 - g_oceanRed) * edgeMix), glow);
+      uint8_t g = oceanChannel((uint8_t)(g_oceanGreen + (255 - g_oceanGreen) * edgeMix), glow);
+      uint8_t b = oceanChannel((uint8_t)(g_oceanBlue + (255 - g_oceanBlue) * edgeMix), glow);
+      setCombinedPixel(edgeRow, col, color(r, g, b));
+    }
+  }
+  uint32_t splashPhase = now / kOceanFrameIntervalMs;
+  if (g_oceanLeftImpactEnergy > 0.18f) {
+    int count = 2 + (int)(g_oceanLeftImpactEnergy * 5.0f);
+    for (int i = 0; i < count; ++i) {
+      int col = 2 + ((i * 3 + splashPhase) % 9);
+      int row = (i + splashPhase) % 3;
+      float glow = 0.75f + g_oceanLeftImpactEnergy * 0.45f;
+      setCombinedPixel(row, col, color(
+          oceanChannel(190, glow), oceanChannel(245, glow), oceanChannel(255, glow)));
+    }
+  }
+  if (g_oceanRightImpactEnergy > 0.18f) {
+    int count = 2 + (int)(g_oceanRightImpactEnergy * 5.0f);
+    for (int i = 0; i < count; ++i) {
+      int col = kCombinedCols - 3 - ((i * 3 + splashPhase) % 9);
+      int row = (i + splashPhase + 1) % 3;
+      float glow = 0.75f + g_oceanRightImpactEnergy * 0.45f;
+      setCombinedPixel(row, col, color(
+          oceanChannel(190, glow), oceanChannel(245, glow), oceanChannel(255, glow)));
+    }
+  }
+  constrainOceanPowerLocked();
   showPixelsLocked();
 }
 
@@ -1393,6 +1611,11 @@ void ledTask(void *) {
           g_mode = 0;
           clearPixels();
           showPixelsLocked();
+        } else if (g_oceanActive) {
+          if (g_oceanLastFrameMs == 0 || now - g_oceanLastFrameMs >= kOceanFrameIntervalMs) {
+            g_oceanLastFrameMs = now;
+            shouldRender = true;
+          }
         } else if (g_clockActive) {
           bool animated = strcmp(g_clockEffect, "steady") != 0;
           if (animated && (g_clockLastFrameMs == 0 || now - g_clockLastFrameMs >= 50)) {
@@ -1417,7 +1640,9 @@ void ledTask(void *) {
           }
         }
         if (shouldRender) {
-          if (g_clockActive) {
+          if (g_oceanActive) {
+            renderOceanLocked(now);
+          } else if (g_clockActive) {
             renderClockLocked(now);
           } else if (g_clipActive) {
             renderClipFrameLocked(g_clipFrame);
@@ -1527,7 +1752,9 @@ bool setBrightness(int brightness) {
   snprintf(command, sizeof(command), "b%d", brightness);
   recordCommand(command);
   g_brightness = brightness;
-  if (g_clockActive) {
+  if (g_oceanActive) {
+    renderOceanLocked(millis());
+  } else if (g_clockActive) {
     renderClockLocked(millis());
   } else if (g_clipActive) {
     renderClipFrameLocked(g_clipFrame);
@@ -1686,6 +1913,94 @@ bool stopClock() {
   return ok;
 }
 
+bool startOcean(const OceanConfig &config) {
+  if (!g_ready || config.brightness < 1 || config.brightness > 96 ||
+      config.fillPercent < 20 || config.fillPercent > 80 ||
+      config.sensitivityPercent < 25 || config.sensitivityPercent > 200 ||
+      config.edgeHighlightPercent > 100 ||
+      config.tiltPercent < 50 || config.tiltPercent > 160 ||
+      config.impactPercent > 200 ||
+      config.dampingPercent < 80 || config.dampingPercent > 200 || !takeLedLock()) {
+    return false;
+  }
+
+  releaseClipLocked();
+  g_mode = 0;
+  g_oceanActive = true;
+  g_oceanRed = config.red;
+  g_oceanGreen = config.green;
+  g_oceanBlue = config.blue;
+  g_brightness = config.brightness;
+  g_oceanFillPercent = config.fillPercent;
+  g_oceanSensitivityPercent = config.sensitivityPercent;
+  g_oceanEdgeHighlightPercent = config.edgeHighlightPercent;
+  g_oceanTiltPercent = config.tiltPercent;
+  g_oceanImpactPercent = config.impactPercent;
+  g_oceanDampingPercent = config.dampingPercent;
+  float baseHeight = 1.2f + 6.3f * ((float)g_oceanFillPercent / 100.0f);
+  for (int col = 0; col < kCombinedCols; ++col) {
+    g_oceanHeight[col] = baseHeight + 0.08f * sinf(col * 0.31f);
+    g_oceanVelocity[col] = 0.0f;
+    g_oceanNextHeight[col] = g_oceanHeight[col];
+  }
+  g_oceanFilteredAngle = 0.0f;
+  g_oceanBulkTilt = 0.0f;
+  g_oceanBulkVelocity = 0.0f;
+  g_oceanPreviousInputVelocity = 0.0f;
+  g_oceanLeftImpactEnergy = 0.0f;
+  g_oceanRightImpactEnergy = 0.0f;
+  g_oceanLeftContact = false;
+  g_oceanRightContact = false;
+  uint32_t now = millis();
+  portENTER_CRITICAL(&g_oceanInputMux);
+  g_oceanInputAngleDeg = 0.0f;
+  g_oceanInputAngularVelocityDps = 0.0f;
+  g_oceanInputSequence = 0;
+  g_oceanInputAtMs = now;
+  portEXIT_CRITICAL(&g_oceanInputMux);
+  g_oceanLastFrameMs = now;
+  recordCommand("ocean");
+  renderOceanLocked(now);
+  bool ok = g_lastShowOk;
+  giveLedLock();
+  Serial.printf("[led_matrix] ocean start fill=%u sensitivity=%u tilt=%u impact=%u damping=%u fps=%u\n",
+                (unsigned)g_oceanFillPercent, (unsigned)g_oceanSensitivityPercent,
+                (unsigned)g_oceanTiltPercent, (unsigned)g_oceanImpactPercent,
+                (unsigned)g_oceanDampingPercent,
+                (unsigned)(1000 / kOceanFrameIntervalMs));
+  return ok;
+}
+
+bool updateOceanInput(float angleDeg, float angularVelocityDps, uint32_t sequence) {
+  if (!g_ready || !g_oceanActive || !isfinite(angleDeg) || !isfinite(angularVelocityDps)) return false;
+  portENTER_CRITICAL(&g_oceanInputMux);
+  if (sequence >= g_oceanInputSequence) {
+    g_oceanInputAngleDeg = fmaxf(-35.0f, fminf(35.0f, angleDeg));
+    g_oceanInputAngularVelocityDps = fmaxf(-180.0f, fminf(180.0f, angularVelocityDps));
+    g_oceanInputSequence = sequence;
+    g_oceanInputAtMs = millis();
+  }
+  portEXIT_CRITICAL(&g_oceanInputMux);
+  return true;
+}
+
+bool stopOcean() {
+  if (!g_ready || !takeLedLock()) return false;
+  bool wasActive = g_oceanActive;
+  g_oceanActive = false;
+  g_oceanLastFrameMs = 0;
+  if (wasActive) {
+    g_mode = 0;
+    recordCommand("ocean_stop");
+    clearPixels();
+    showPixelsLocked();
+  }
+  bool ok = !wasActive || g_lastShowOk;
+  giveLedLock();
+  if (wasActive) Serial.println("[led_matrix] ocean stop");
+  return ok;
+}
+
 bool stopExpression(bool syncDisplay) {
   bool ok = setModeLocal(0, true, 0);
   if (syncDisplay) DisplayLink::sendClipStop();
@@ -1765,6 +2080,22 @@ const char *clockEffect() {
 void clockTime(char *out, size_t outLen) {
   if (!out || outLen == 0) return;
   snprintf(out, outLen, "%02u:%02u", g_clockHour, g_clockMinute);
+}
+
+bool oceanActive() {
+  return g_oceanActive;
+}
+
+uint32_t oceanInputAgeMs() {
+  uint32_t inputAt = 0;
+  portENTER_CRITICAL(&g_oceanInputMux);
+  inputAt = g_oceanInputAtMs;
+  portEXIT_CRITICAL(&g_oceanInputMux);
+  return inputAt == 0 ? 0 : millis() - inputAt;
+}
+
+uint8_t oceanRenderFps() {
+  return (uint8_t)(1000 / kOceanFrameIntervalMs);
 }
 
 int txPin() {

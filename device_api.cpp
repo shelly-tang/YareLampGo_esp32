@@ -21,7 +21,7 @@
 
 namespace {
 
-const char *FIRMWARE_VERSION = "lampgo-cam 0.5.1";
+const char *FIRMWARE_VERSION = "lampgo-cam 0.6.0";
 
 bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
   if (!dst || !used || !src || *used >= dstLen) return false;
@@ -240,6 +240,9 @@ void addLedStatus(cJSON *root) {
   char clockTime[8] = {};
   LedSerial::clockTime(clockTime, sizeof(clockTime));
   cJSON_AddStringToObject(root, "led_clock_time", clockTime);
+  cJSON_AddBoolToObject(root, "led_ocean_active", LedSerial::oceanActive());
+  cJSON_AddNumberToObject(root, "led_ocean_fps", LedSerial::oceanRenderFps());
+  cJSON_AddNumberToObject(root, "led_ocean_input_age_ms", (double)LedSerial::oceanInputAgeMs());
 }
 
 void addLedSupportedModes(cJSON *root) {
@@ -410,6 +413,9 @@ bool writeDebugStatusJson(char *body, size_t bodyLen) {
                            LedSerial::currentBrightness());
   ok = ok && appendFormat(body, bodyLen, &used, ",\"led_clock_active\":%s,\"led_clock_effect\":\"%s\",\"led_clock_time\":\"%s\"",
                            LedSerial::clockActive() ? "true" : "false", LedSerial::clockEffect(), clockTime);
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_ocean_active\":%s,\"led_ocean_fps\":%u,\"led_ocean_input_age_ms\":%.0f",
+                           LedSerial::oceanActive() ? "true" : "false",
+                           (unsigned)LedSerial::oceanRenderFps(), (double)LedSerial::oceanInputAgeMs());
   ok = ok && appendRaw(body, bodyLen, &used, ",\"led_last_command\":\"");
   ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::lastCommand());
   ok = ok && appendFormat(body, bodyLen, &used,
@@ -467,6 +473,8 @@ bool writeCompactStatusJson(char *body, size_t bodyLen) {
   bool paired = NetConfig::loadPairing(ownerId, ownerLabel, secretHash);
   String ip = WiFi.localIP().toString();
   int ledMode = LedSerial::currentMode();
+  char clockTime[8] = {};
+  LedSerial::clockTime(clockTime, sizeof(clockTime));
 
   size_t used = 0;
   body[0] = '\0';
@@ -524,6 +532,9 @@ bool writeCompactStatusJson(char *body, size_t bodyLen) {
                            LedSerial::currentBrightness());
   ok = ok && appendFormat(body, bodyLen, &used, ",\"led_clock_active\":%s,\"led_clock_effect\":\"%s\",\"led_clock_time\":\"%s\"",
                            LedSerial::clockActive() ? "true" : "false", LedSerial::clockEffect(), clockTime);
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_ocean_active\":%s,\"led_ocean_fps\":%u,\"led_ocean_input_age_ms\":%.0f",
+                           LedSerial::oceanActive() ? "true" : "false",
+                           (unsigned)LedSerial::oceanRenderFps(), (double)LedSerial::oceanInputAgeMs());
   ok = ok && appendRaw(body, bodyLen, &used, ",\"led_last_command\":\"");
   ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::lastCommand());
   ok = ok && appendRaw(body, bodyLen, &used, "\"");
@@ -886,6 +897,82 @@ esp_err_t deviceClockPostHandler(httpd_req_t *req) {
   if (!ok) return sendBadRequestJson(req, "clock apply failed");
   cJSON *root = cJSON_CreateObject();
   cJSON_AddBoolToObject(root, "ok", true);
+  addLedStatus(root);
+  return sendJson(req, root);
+}
+
+esp_err_t deviceOceanPostHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 768);
+  if (!doc) return sendBadRequestJson(req, "bad ocean JSON");
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  const cJSON *actionItem = cJSON_GetObjectItemCaseSensitive(doc, "action");
+  if (!cJSON_IsString(actionItem) || !actionItem->valuestring) {
+    cJSON_Delete(doc);
+    return sendBadRequestJson(req, "ocean action required");
+  }
+  char action[12] = {};
+  snprintf(action, sizeof(action), "%s", actionItem->valuestring);
+  bool ok = false;
+  if (strcmp(action, "stop") == 0) {
+    ok = LedSerial::stopOcean();
+  } else if (strcmp(action, "input") == 0) {
+    const cJSON *angle = cJSON_GetObjectItemCaseSensitive(doc, "angle_deg");
+    const cJSON *velocity = cJSON_GetObjectItemCaseSensitive(doc, "angular_velocity_dps");
+    const cJSON *sequence = cJSON_GetObjectItemCaseSensitive(doc, "sequence");
+    if (!cJSON_IsNumber(angle) || !cJSON_IsNumber(velocity) || !cJSON_IsNumber(sequence) ||
+        angle->valuedouble < -35.0 || angle->valuedouble > 35.0 ||
+        velocity->valuedouble < -180.0 || velocity->valuedouble > 180.0 || sequence->valuedouble < 0) {
+      cJSON_Delete(doc);
+      return sendBadRequestJson(req, "invalid ocean input");
+    }
+    ok = LedSerial::updateOceanInput(
+        (float)angle->valuedouble, (float)velocity->valuedouble, (uint32_t)sequence->valuedouble);
+  } else if (strcmp(action, "start") == 0) {
+    const cJSON *colorItem = cJSON_GetObjectItemCaseSensitive(doc, "color");
+    const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(doc, "brightness");
+    const cJSON *fill = cJSON_GetObjectItemCaseSensitive(doc, "fill_percent");
+    const cJSON *sensitivity = cJSON_GetObjectItemCaseSensitive(doc, "sensitivity_percent");
+    const cJSON *edge = cJSON_GetObjectItemCaseSensitive(doc, "edge_highlight_percent");
+    const cJSON *tilt = cJSON_GetObjectItemCaseSensitive(doc, "tilt_percent");
+    const cJSON *impact = cJSON_GetObjectItemCaseSensitive(doc, "impact_percent");
+    const cJSON *damping = cJSON_GetObjectItemCaseSensitive(doc, "damping_percent");
+    int tiltPercent = cJSON_IsNumber(tilt) ? tilt->valueint : 100;
+    int impactPercent = cJSON_IsNumber(impact) ? impact->valueint : 100;
+    int dampingPercent = cJSON_IsNumber(damping) ? damping->valueint : 130;
+    uint8_t red = 0, green = 184, blue = 224;
+    if (!cJSON_IsString(colorItem) || !colorItem->valuestring ||
+        !cJSON_IsNumber(brightness) || !cJSON_IsNumber(fill) || !cJSON_IsNumber(sensitivity) ||
+        !cJSON_IsNumber(edge) || !parseHexColor(colorItem->valuestring, red, green, blue) ||
+        brightness->valueint < 1 || brightness->valueint > 96 ||
+        fill->valueint < 20 || fill->valueint > 80 ||
+        sensitivity->valueint < 25 || sensitivity->valueint > 200 ||
+        edge->valueint < 0 || edge->valueint > 100 ||
+        tiltPercent < 50 || tiltPercent > 160 || impactPercent < 0 || impactPercent > 200 ||
+        dampingPercent < 80 || dampingPercent > 200) {
+      cJSON_Delete(doc);
+      return sendBadRequestJson(req, "invalid ocean settings");
+    }
+    LedSerial::OceanConfig config{
+        red, green, blue, (uint8_t)brightness->valueint, (uint8_t)fill->valueint,
+        (uint8_t)sensitivity->valueint, (uint8_t)edge->valueint,
+        (uint8_t)tiltPercent, (uint8_t)impactPercent, (uint8_t)dampingPercent};
+    ok = LedSerial::startOcean(config);
+  } else {
+    cJSON_Delete(doc);
+    return sendBadRequestJson(req, "unknown ocean action");
+  }
+  cJSON_Delete(doc);
+  if (!ok) return sendBadRequestJson(req, "ocean action failed");
+  if (strcmp(action, "input") == 0) {
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"action\":\"input\"}");
+  }
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  cJSON_AddStringToObject(root, "action", action);
   addLedStatus(root);
   return sendJson(req, root);
 }
@@ -1592,6 +1679,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/led", .method = HTTP_GET, .handler = deviceLedGetHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_POST, .handler = deviceLedPostHandler, .user_ctx = NULL},
       {.uri = "/device/clock", .method = HTTP_POST, .handler = deviceClockPostHandler, .user_ctx = NULL},
+      {.uri = "/device/ocean", .method = HTTP_POST, .handler = deviceOceanPostHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/play", .method = HTTP_POST, .handler = deviceExpressionPlayHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/stop", .method = HTTP_POST, .handler = deviceExpressionStopHandler, .user_ctx = NULL},
       {.uri = "/device/led-effects", .method = HTTP_GET, .handler = deviceLedEffectsListHandler, .user_ctx = NULL},
@@ -1611,6 +1699,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/clock", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/ocean", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/play", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/stop", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led-effects", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},

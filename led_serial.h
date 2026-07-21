@@ -47,6 +47,19 @@ struct ClockConfig {
   const char *effect;
 };
 
+struct OceanConfig {
+  uint8_t red;
+  uint8_t green;
+  uint8_t blue;
+  uint8_t brightness;
+  uint8_t fillPercent;
+  uint8_t sensitivityPercent;
+  uint8_t edgeHighlightPercent;
+  uint8_t tiltPercent;
+  uint8_t impactPercent;
+  uint8_t dampingPercent;
+};
+
 bool begin();
 bool isReady();
 
@@ -60,6 +73,9 @@ bool playStoredEffect(const StoredEffectConfig &config);
 bool stopExpression(bool syncDisplay = true);
 bool showClock(const ClockConfig &config);
 bool stopClock();
+bool startOcean(const OceanConfig &config);
+bool updateOceanInput(float angleDeg, float angularVelocityDps, uint32_t sequence);
+bool stopOcean();
 
 int resolveMode(const char *name);
 const char *modeName(int mode);
@@ -78,6 +94,9 @@ bool outputOk();
 bool clockActive();
 const char *clockEffect();
 void clockTime(char *out, size_t outLen);
+bool oceanActive();
+uint32_t oceanInputAgeMs();
+uint8_t oceanRenderFps();
 
 int txPin();
 int rxPin();
