@@ -88,6 +88,15 @@ uint8_t g_storedPackedFrame[LedClipPlayer::kFrameBytes] = {};
 bool g_expressionLoop = true;
 uint32_t g_expressionEndMs = 0;
 
+bool g_clockActive = false;
+uint8_t g_clockHour = 0;
+uint8_t g_clockMinute = 0;
+uint8_t g_clockRed = 55;
+uint8_t g_clockGreen = 214;
+uint8_t g_clockBlue = 255;
+char g_clockEffect[8] = "steady";
+uint32_t g_clockLastFrameMs = 0;
+
 bool g_focusEyesOpen = true;
 uint8_t g_focusBlinksRemaining = 0;
 uint32_t g_focusNextTransitionMs = 0;
@@ -640,12 +649,83 @@ void releaseClipLocked() {
   snprintf(g_effectDirection, sizeof(g_effectDirection), "right");
   g_expressionLoop = true;
   g_expressionEndMs = 0;
+  g_clockActive = false;
 }
 
 bool showPixelsLocked();
 void renderRingFill(uint32_t pixelColor, uint32_t frame);
 void drawBitmap8Pair(const uint8_t bitmap[8][8], uint32_t pixelColor, int rowOffset = 0);
 void drawCombinedPattern(int patternIndex, uint32_t primaryColor, uint32_t secondaryColor = 0);
+
+constexpr uint8_t kClockDigits[10][7] = {
+    {0b111, 0b101, 0b101, 0b101, 0b101, 0b101, 0b111},
+    {0b010, 0b110, 0b010, 0b010, 0b010, 0b010, 0b111},
+    {0b111, 0b001, 0b001, 0b111, 0b100, 0b100, 0b111},
+    {0b111, 0b001, 0b001, 0b111, 0b001, 0b001, 0b111},
+    {0b101, 0b101, 0b101, 0b111, 0b001, 0b001, 0b001},
+    {0b111, 0b100, 0b100, 0b111, 0b001, 0b001, 0b111},
+    {0b111, 0b100, 0b100, 0b111, 0b101, 0b101, 0b111},
+    {0b111, 0b001, 0b001, 0b010, 0b010, 0b010, 0b010},
+    {0b111, 0b101, 0b101, 0b111, 0b101, 0b101, 0b111},
+    {0b111, 0b101, 0b101, 0b111, 0b001, 0b001, 0b111},
+};
+
+uint32_t clockColor(uint8_t percent = 100) {
+  uint32_t scale = (uint32_t)g_brightness * percent;
+  return color(
+      (uint8_t)((g_clockRed * scale) / 25500UL),
+      (uint8_t)((g_clockGreen * scale) / 25500UL),
+      (uint8_t)((g_clockBlue * scale) / 25500UL));
+}
+
+void drawClockDigit(int digit, int startCol, uint32_t pixelColor) {
+  if (digit < 0 || digit > 9) return;
+  for (int row = 0; row < 7; ++row) {
+    for (int col = 0; col < 3; ++col) {
+      if ((kClockDigits[digit][row] & (1 << (2 - col))) == 0) continue;
+      setCombinedPixel(row + 1, startCol + col * 2, pixelColor);
+      setCombinedPixel(row + 1, startCol + col * 2 + 1, pixelColor);
+    }
+  }
+}
+
+void renderClockOrbit(uint32_t now) {
+  constexpr int kPerimeter = 2 * kCombinedCols + 2 * (kPanelRows - 2);
+  int position = (int)((now / 45UL) % kPerimeter);
+  int row = 0;
+  int col = 0;
+  if (position < kCombinedCols) {
+    col = position;
+  } else if ((position -= kCombinedCols) < kPanelRows - 1) {
+    col = kCombinedCols - 1;
+    row = position;
+  } else if ((position -= kPanelRows - 1) < kCombinedCols) {
+    col = kCombinedCols - 1 - position;
+    row = kPanelRows - 1;
+  } else {
+    position -= kCombinedCols;
+    col = 0;
+    row = kPanelRows - 1 - position;
+  }
+  setCombinedPixel(row, col, clockColor());
+  setCombinedPixel(row == 0 ? 1 : row == kPanelRows - 1 ? kPanelRows - 2 : row, col, clockColor(35));
+}
+
+void renderClockLocked(uint32_t now) {
+  clearPixels();
+  bool visible = strcmp(g_clockEffect, "blink") != 0 || ((now / 500UL) % 2U) == 0;
+  if (visible) {
+    uint32_t primary = clockColor();
+    drawClockDigit(g_clockHour / 10, 7, primary);
+    drawClockDigit(g_clockHour % 10, 15, primary);
+    setCombinedPixel(3, 23, primary);
+    setCombinedPixel(6, 23, primary);
+    drawClockDigit(g_clockMinute / 10, 27, primary);
+    drawClockDigit(g_clockMinute % 10, 35, primary);
+  }
+  if (strcmp(g_clockEffect, "orbit") == 0) renderClockOrbit(now);
+  showPixelsLocked();
+}
 
 void drawDizzyMouthLocked(uint32_t frameIndex) {
   int phase = (int)(frameIndex % 30);
@@ -1313,6 +1393,12 @@ void ledTask(void *) {
           g_mode = 0;
           clearPixels();
           showPixelsLocked();
+        } else if (g_clockActive) {
+          bool animated = strcmp(g_clockEffect, "steady") != 0;
+          if (animated && (g_clockLastFrameMs == 0 || now - g_clockLastFrameMs >= 50)) {
+            g_clockLastFrameMs = now;
+            shouldRender = true;
+          }
         } else if (g_clipActive) {
           uint32_t interval = g_clipFps > 0 ? (1000UL / g_clipFps) : 100;
           if (interval < 16) interval = 16;
@@ -1331,7 +1417,9 @@ void ledTask(void *) {
           }
         }
         if (shouldRender) {
-          if (g_clipActive) {
+          if (g_clockActive) {
+            renderClockLocked(now);
+          } else if (g_clipActive) {
             renderClipFrameLocked(g_clipFrame);
           } else {
             renderCurrentLocked();
@@ -1439,7 +1527,9 @@ bool setBrightness(int brightness) {
   snprintf(command, sizeof(command), "b%d", brightness);
   recordCommand(command);
   g_brightness = brightness;
-  if (g_clipActive) {
+  if (g_clockActive) {
+    renderClockLocked(millis());
+  } else if (g_clipActive) {
     renderClipFrameLocked(g_clipFrame);
   } else {
     resetAnimationStateLocked(millis());
@@ -1553,6 +1643,49 @@ bool playStoredEffect(const StoredEffectConfig &config) {
   return ok;
 }
 
+bool showClock(const ClockConfig &config) {
+  if (!g_ready || config.hour > 23 || config.minute > 59 || !config.effect || !takeLedLock()) return false;
+  if (strcmp(config.effect, "steady") != 0 && strcmp(config.effect, "blink") != 0 &&
+      strcmp(config.effect, "orbit") != 0) {
+    giveLedLock();
+    return false;
+  }
+
+  releaseClipLocked();
+  g_mode = 0;
+  g_clockActive = true;
+  g_clockHour = config.hour;
+  g_clockMinute = config.minute;
+  g_clockRed = config.red;
+  g_clockGreen = config.green;
+  g_clockBlue = config.blue;
+  snprintf(g_clockEffect, sizeof(g_clockEffect), "%s", config.effect);
+  if (config.brightness >= 1) g_brightness = config.brightness > 96 ? 96 : config.brightness;
+  g_clockLastFrameMs = millis();
+  recordCommand("clock");
+  renderClockLocked(g_clockLastFrameMs);
+  bool ok = g_lastShowOk;
+  giveLedLock();
+  Serial.printf("[led_matrix] clock=%02u:%02u effect=%s\n", g_clockHour, g_clockMinute, g_clockEffect);
+  return ok;
+}
+
+bool stopClock() {
+  if (!g_ready || !takeLedLock()) return false;
+  bool wasActive = g_clockActive;
+  g_clockActive = false;
+  g_clockLastFrameMs = 0;
+  if (wasActive) {
+    g_mode = 0;
+    recordCommand("clock_stop");
+    clearPixels();
+    showPixelsLocked();
+  }
+  bool ok = !wasActive || g_lastShowOk;
+  giveLedLock();
+  return ok;
+}
+
 bool stopExpression(bool syncDisplay) {
   bool ok = setModeLocal(0, true, 0);
   if (syncDisplay) DisplayLink::sendClipStop();
@@ -1619,6 +1752,19 @@ int panelCount() {
 
 bool outputOk() {
   return g_lastShowOk || g_lastWriteMs == 0;
+}
+
+bool clockActive() {
+  return g_clockActive;
+}
+
+const char *clockEffect() {
+  return g_clockEffect;
+}
+
+void clockTime(char *out, size_t outLen) {
+  if (!out || outLen == 0) return;
+  snprintf(out, outLen, "%02u:%02u", g_clockHour, g_clockMinute);
 }
 
 int txPin() {

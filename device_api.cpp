@@ -21,7 +21,7 @@
 
 namespace {
 
-const char *FIRMWARE_VERSION = "lampgo-cam 0.5.0";
+const char *FIRMWARE_VERSION = "lampgo-cam 0.5.1";
 
 bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
   if (!dst || !used || !src || *used >= dstLen) return false;
@@ -235,6 +235,11 @@ void addLedStatus(cJSON *root) {
   cJSON_AddNumberToObject(root, "led_pixel_count", LedSerial::pixelCount());
   cJSON_AddNumberToObject(root, "led_panel_count", LedSerial::panelCount());
   cJSON_AddBoolToObject(root, "led_output_ok", LedSerial::outputOk());
+  cJSON_AddBoolToObject(root, "led_clock_active", LedSerial::clockActive());
+  cJSON_AddStringToObject(root, "led_clock_effect", LedSerial::clockEffect());
+  char clockTime[8] = {};
+  LedSerial::clockTime(clockTime, sizeof(clockTime));
+  cJSON_AddStringToObject(root, "led_clock_time", clockTime);
 }
 
 void addLedSupportedModes(cJSON *root) {
@@ -285,6 +290,8 @@ bool writeDebugStatusJson(char *body, size_t bodyLen) {
   String ip = WiFi.localIP().toString();
   String ssid = WiFi.SSID();
   int ledMode = LedSerial::currentMode();
+  char clockTime[8] = {};
+  LedSerial::clockTime(clockTime, sizeof(clockTime));
 
   size_t used = 0;
   body[0] = '\0';
@@ -401,6 +408,8 @@ bool writeDebugStatusJson(char *body, size_t bodyLen) {
   ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::modeName(ledMode));
   ok = ok && appendFormat(body, bodyLen, &used, "\",\"led_brightness\":%d",
                            LedSerial::currentBrightness());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_clock_active\":%s,\"led_clock_effect\":\"%s\",\"led_clock_time\":\"%s\"",
+                           LedSerial::clockActive() ? "true" : "false", LedSerial::clockEffect(), clockTime);
   ok = ok && appendRaw(body, bodyLen, &used, ",\"led_last_command\":\"");
   ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::lastCommand());
   ok = ok && appendFormat(body, bodyLen, &used,
@@ -513,6 +522,8 @@ bool writeCompactStatusJson(char *body, size_t bodyLen) {
   ok = ok && appendRaw(body, bodyLen, &used, "\"");
   ok = ok && appendFormat(body, bodyLen, &used, ",\"led_brightness\":%d",
                            LedSerial::currentBrightness());
+  ok = ok && appendFormat(body, bodyLen, &used, ",\"led_clock_active\":%s,\"led_clock_effect\":\"%s\",\"led_clock_time\":\"%s\"",
+                           LedSerial::clockActive() ? "true" : "false", LedSerial::clockEffect(), clockTime);
   ok = ok && appendRaw(body, bodyLen, &used, ",\"led_last_command\":\"");
   ok = ok && appendJsonEscaped(body, bodyLen, &used, LedSerial::lastCommand());
   ok = ok && appendRaw(body, bodyLen, &used, "\"");
@@ -829,6 +840,54 @@ bool parseHexColor(const char *value, uint8_t &red, uint8_t &green, uint8_t &blu
   green = (uint8_t)parsedGreen;
   blue = (uint8_t)parsedBlue;
   return true;
+}
+
+esp_err_t deviceClockPostHandler(httpd_req_t *req) {
+  setJsonHeaders(req);
+  cJSON *doc = readJsonBody(req, 384);
+  if (!doc) return sendBadRequestJson(req, "bad clock JSON");
+  if (!requestAuthorized(doc)) {
+    cJSON_Delete(doc);
+    return sendForbidden(req, "pairing_mismatch");
+  }
+  const cJSON *enabled = cJSON_GetObjectItemCaseSensitive(doc, "enabled");
+  if (cJSON_IsBool(enabled) && !cJSON_IsTrue(enabled)) {
+    bool ok = LedSerial::stopClock();
+    cJSON_Delete(doc);
+    if (!ok) return sendBadRequestJson(req, "clock stop failed");
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddBoolToObject(root, "ok", true);
+    addLedStatus(root);
+    return sendJson(req, root);
+  }
+
+  const cJSON *hour = cJSON_GetObjectItemCaseSensitive(doc, "hour");
+  const cJSON *minute = cJSON_GetObjectItemCaseSensitive(doc, "minute");
+  const cJSON *colorItem = cJSON_GetObjectItemCaseSensitive(doc, "color");
+  const cJSON *brightness = cJSON_GetObjectItemCaseSensitive(doc, "brightness");
+  const cJSON *effect = cJSON_GetObjectItemCaseSensitive(doc, "effect");
+  if (!cJSON_IsNumber(hour) || !cJSON_IsNumber(minute) || !cJSON_IsString(colorItem) || !colorItem->valuestring ||
+      !cJSON_IsNumber(brightness) || !cJSON_IsString(effect) || !effect->valuestring) {
+    cJSON_Delete(doc);
+    return sendBadRequestJson(req, "clock needs hour, minute, color, brightness, effect");
+  }
+  uint8_t red = 0, green = 0, blue = 0;
+  if (hour->valueint < 0 || hour->valueint > 23 || minute->valueint < 0 || minute->valueint > 59 ||
+      brightness->valueint < 1 || brightness->valueint > 96 ||
+      !parseHexColor(colorItem->valuestring, red, green, blue)) {
+    cJSON_Delete(doc);
+    return sendBadRequestJson(req, "invalid clock values");
+  }
+  LedSerial::ClockConfig config{
+      (uint8_t)hour->valueint, (uint8_t)minute->valueint, red, green, blue,
+      (uint8_t)brightness->valueint, effect->valuestring};
+  bool ok = LedSerial::showClock(config);
+  cJSON_Delete(doc);
+  if (!ok) return sendBadRequestJson(req, "clock apply failed");
+  cJSON *root = cJSON_CreateObject();
+  cJSON_AddBoolToObject(root, "ok", true);
+  addLedStatus(root);
+  return sendJson(req, root);
 }
 
 void applyEffectParams(const cJSON *params,
@@ -1532,6 +1591,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/config", .method = HTTP_POST, .handler = deviceConfigPostHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_GET, .handler = deviceLedGetHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_POST, .handler = deviceLedPostHandler, .user_ctx = NULL},
+      {.uri = "/device/clock", .method = HTTP_POST, .handler = deviceClockPostHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/play", .method = HTTP_POST, .handler = deviceExpressionPlayHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/stop", .method = HTTP_POST, .handler = deviceExpressionStopHandler, .user_ctx = NULL},
       {.uri = "/device/led-effects", .method = HTTP_GET, .handler = deviceLedEffectsListHandler, .user_ctx = NULL},
@@ -1550,6 +1610,7 @@ bool registerHandlers(httpd_handle_t server) {
       {.uri = "/device/debug/status", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/config", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
+      {.uri = "/device/clock", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/play", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/expressions/stop", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
       {.uri = "/device/led-effects", .method = HTTP_OPTIONS, .handler = deviceOptionsHandler, .user_ctx = NULL},
