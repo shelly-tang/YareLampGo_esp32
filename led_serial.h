@@ -4,6 +4,7 @@
 #ifndef LAMPGO_LED_SERIAL_H
 #define LAMPGO_LED_SERIAL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "led_clip_player.h"
@@ -36,6 +37,16 @@ struct StoredEffectConfig {
   uint32_t durationMs;
 };
 
+struct ClockConfig {
+  uint8_t hour;
+  uint8_t minute;
+  uint8_t red;
+  uint8_t green;
+  uint8_t blue;
+  uint8_t brightness;
+  const char *effect;
+};
+
 bool begin();
 bool isReady();
 
@@ -47,6 +58,8 @@ bool playClip(const char *clipId);
 bool playEffect(const EffectConfig &config);
 bool playStoredEffect(const StoredEffectConfig &config);
 bool stopExpression(bool syncDisplay = true);
+bool showClock(const ClockConfig &config);
+bool stopClock();
 
 int resolveMode(const char *name);
 const char *modeName(int mode);
@@ -62,6 +75,9 @@ int pixelPin();
 int pixelCount();
 int panelCount();
 bool outputOk();
+bool clockActive();
+const char *clockEffect();
+void clockTime(char *out, size_t outLen);
 
 int txPin();
 int rxPin();
