@@ -803,7 +803,9 @@ esp_err_t deviceLedPostHandler(httpd_req_t *req) {
   if (!clipPlayed && mode >= 0) {
     if (mode > LedSerial::maxMode()) {
       cJSON_Delete(doc);
-      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "mode must be 0-33");
+      char error[48];
+      snprintf(error, sizeof(error), "mode must be 0-%d", LedSerial::maxMode());
+      httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, error);
       return ESP_FAIL;
     }
     if (!LedSerial::setMode(mode)) {
@@ -1036,9 +1038,9 @@ esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
   bool loopPlayback = playback.length() == 0 || playback == "loop";
   const cJSON *durationItem = cJSON_GetObjectItemCaseSensitive(doc, "duration_ms");
   uint32_t durationMs = cJSON_IsNumber(durationItem) ? (uint32_t)durationItem->valuedouble : 3000;
-  if (durationMs < 2500 || durationMs > 3500) {
+  if (durationMs < 1000 || durationMs > 3500) {
     cJSON_Delete(doc);
-    return sendBadRequestJson(req, "duration_ms must be 2500-3500");
+    return sendBadRequestJson(req, "duration_ms must be 1000-3500");
   }
 
   const cJSON *modeItem = cJSON_GetObjectItemCaseSensitive(doc, "led_mode");

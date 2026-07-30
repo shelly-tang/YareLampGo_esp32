@@ -42,7 +42,7 @@ namespace {
 
 constexpr int kPanelRows = 9;
 constexpr int kCombinedCols = 51;
-constexpr int kMaxMode = 33;
+constexpr int kMaxMode = 34;
 constexpr int kPatternRows = 8;
 constexpr int kPatternCols = 16;
 constexpr int kIrregularRowCount = 9;
@@ -167,6 +167,7 @@ const char *const kModeNames[kMaxMode + 1] = {
     "focused",
     "wink",
     "myu7gt",
+    "ecstatic",
 };
 
 const uint8_t kCheckPattern[8][8] = {
@@ -538,6 +539,9 @@ const ModeAlias kAliases[] = {
     {"mgt", 33},
     {"yu7gt", 33},
     {"yu7", 33},
+    {"ecstatic", 34},
+    {"ecstasy", 34},
+    {"hyped", 34},
 };
 
 void normalizeKey(const char *input, char *out, size_t outLen) {
@@ -1318,6 +1322,54 @@ void renderMusic(uint32_t frame) {
   drawBitmap8Pair(kMusicNote, colors[(frame / 7) % 4], offsets[frame % 7]);
 }
 
+void renderEcstaticMouth(uint32_t frame) {
+  // A 30-frame, one-second loop: the mouth opens on the beat, flashes teeth,
+  // then compresses into a grin before the next beat. Yellow side sparks tie
+  // it visually to the C6 ecstatic eye clip.
+  clearPixels();
+  const uint32_t phase = frame % 30;
+  const int beat = phase < 15 ? (int)phase : 29 - (int)phase;
+  const int halfWidth = 13 + beat / 2;
+  const int halfHeight = 2 + beat / 5;
+  const int centerX = 25 + ((phase / 4) % 2 == 0 ? -1 : 1);
+  const int centerY = 4;
+  const uint32_t white = color(g_brightness, g_brightness, g_brightness);
+  const uint32_t yellow = color(g_brightness, scaledBrightness(215), 0);
+  const uint32_t hotPink = color(g_brightness, scaledBrightness(30), scaledBrightness(120));
+  const uint32_t deepPink = color(scaledBrightness(95), 0, scaledBrightness(35));
+
+  for (int row = 0; row < kPanelRows; ++row) {
+    for (int col = 0; col < kCombinedCols; ++col) {
+      const int dx = col - centerX;
+      const int dy = row - centerY;
+      const int outer = (dx * dx * 100) / (halfWidth * halfWidth) +
+                        (dy * dy * 100) / (halfHeight * halfHeight);
+      if (outer > 112) continue;
+
+      const int innerWidth = max(1, halfWidth - 3);
+      const int innerHeight = max(1, halfHeight - 1);
+      const int inner = (dx * dx * 100) / (innerWidth * innerWidth) +
+                        (dy * dy * 100) / (innerHeight * innerHeight);
+      if (inner >= 62) {
+        setCombinedPixel(row, col, row <= centerY ? white : hotPink);
+      } else if (beat >= 6 && row >= centerY) {
+        setCombinedPixel(row, col, ((col + phase) % 3 == 0) ? hotPink : deepPink);
+      }
+    }
+  }
+
+  if (beat >= 5) {
+    const int left = centerX - halfWidth - 2;
+    const int right = centerX + halfWidth + 2;
+    setCombinedPixel(2, left, yellow);
+    setCombinedPixel(1, left - 2, yellow);
+    setCombinedPixel(5, left - 1, yellow);
+    setCombinedPixel(2, right, yellow);
+    setCombinedPixel(1, right + 2, yellow);
+    setCombinedPixel(5, right + 1, yellow);
+  }
+}
+
 void renderThinking(uint32_t frame) {
   clearPixels();
   uint8_t low = g_brightness / 10;
@@ -1380,7 +1432,8 @@ bool modeIsAnimated(int mode) {
          mode == 28 ||
          mode == 29 ||
          mode == 31 ||
-         mode == 32;
+         mode == 32 ||
+         mode == 34;
 }
 
 bool animationStopsAfterHold(int mode) {
@@ -1427,6 +1480,8 @@ uint32_t frameIntervalMs(int mode) {
       return 200;
     case 32:
       return 50;
+    case 34:
+      return (g_animFrame % 3U == 2U) ? 34 : 33;
     default:
       return 1000;
   }
@@ -1547,6 +1602,9 @@ void renderCurrentLocked() {
     case 33:
       drawCombinedPattern(22, color(g_brightness, g_brightness, g_brightness), color(g_brightness, 0, 0));
       break;
+    case 34:
+      renderEcstaticMouth(g_animFrame);
+      break;
     default:
       clearPixels();
       break;
@@ -1627,15 +1685,22 @@ void ledTask(void *) {
           if (interval < 16) interval = 16;
           if (g_clipLastFrameMs == 0 || now - g_clipLastFrameMs >= interval) {
             g_clipFrame = (g_clipFrame + 1) % g_clipFrameCount;
-            g_clipLastFrameMs = now;
+            g_clipLastFrameMs =
+                g_clipLastFrameMs == 0 || now - g_clipLastFrameMs >= interval * 2
+                    ? now
+                    : g_clipLastFrameMs + interval;
             shouldRender = true;
           }
         } else if (g_mode == 31) {
           shouldRender = updateFocusedAnimationLocked(now);
         } else if (modeIsAnimated(g_mode) && !animationIsComplete(g_mode)) {
-          if (g_lastFrameMs == 0 || now - g_lastFrameMs >= frameIntervalMs(g_mode)) {
+          const uint32_t interval = frameIntervalMs(g_mode);
+          if (g_lastFrameMs == 0 || now - g_lastFrameMs >= interval) {
             g_animFrame++;
-            g_lastFrameMs = now;
+            g_lastFrameMs =
+                g_lastFrameMs == 0 || now - g_lastFrameMs >= interval * 2
+                    ? now
+                    : g_lastFrameMs + interval;
             shouldRender = true;
           }
         }
@@ -1653,7 +1718,9 @@ void ledTask(void *) {
         xSemaphoreGive(g_mutex);
       }
     }
-    vTaskDelay(pdMS_TO_TICKS(20));
+    // Five-millisecond polling keeps 30fps effects on a 33/34ms deadline even
+    // after the ~13ms WS2812 transfer, without busy-waiting.
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 

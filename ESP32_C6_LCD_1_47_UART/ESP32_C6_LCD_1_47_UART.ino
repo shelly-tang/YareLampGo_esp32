@@ -34,6 +34,21 @@
 #ifndef C6_LINK_RX_BUFFER
 #define C6_LINK_RX_BUFFER 8192
 #endif
+#ifndef C6_CLIP_MIN_FPS
+#define C6_CLIP_MIN_FPS 8
+#endif
+#ifndef C6_CLIP_MAX_FPS
+#define C6_CLIP_MAX_FPS 30
+#endif
+#ifndef C6_LCD_SPI_HZ
+#define C6_LCD_SPI_HZ 40000000
+#endif
+#define C6_CLIP_WIDTH 320
+#define C6_CLIP_HEIGHT 172
+#define C6_CLIP_TILE_SIZE 16
+#define C6_CLIP_TILE_COLS ((C6_CLIP_WIDTH + C6_CLIP_TILE_SIZE - 1) / C6_CLIP_TILE_SIZE)
+#define C6_CLIP_TILE_ROWS ((C6_CLIP_HEIGHT + C6_CLIP_TILE_SIZE - 1) / C6_CLIP_TILE_SIZE)
+#define C6_CLIP_PERF_REPORT_FRAMES 30
 #define CLIP_DEBUG_LOG_PATH "/clip_debug.log"
 #define CLIP_DEBUG_LOG_MAX_BYTES 8192
 
@@ -78,6 +93,18 @@ static uint16_t g_clipFps = 0;
 static uint16_t g_clipFrameIndex = 0;
 static uint32_t g_nextClipFrameMs = 0;
 static bool g_clipLoop = true;
+// The clip framebuffer is stored in LCD wire order (RGB565 high byte first).
+// It lets the C6 compare real pixel changes instead of blindly transmitting the
+// encoder's bounding rectangle, whose unchanged interior can be very large.
+static uint8_t g_clipShadow[C6_CLIP_WIDTH * C6_CLIP_HEIGHT * 2];
+static bool g_clipShadowValid = false;
+static uint32_t g_clipPerfFrames = 0;
+static uint32_t g_clipPerfDecodeUs = 0;
+static uint32_t g_clipPerfLcdUs = 0;
+static uint32_t g_clipPerfMaxFrameUs = 0;
+static uint32_t g_clipPerfBudgetMisses = 0;
+static uint32_t g_clipPerfLcdPixels = 0;
+static uint32_t g_clipPerfLcdRects = 0;
 static String g_syncClipId;
 static uint32_t g_syncExpectedBytes = 0;
 static String g_syncExpectedSha256;
@@ -140,6 +167,7 @@ static void lcdWriteData(uint8_t data) {
 
 static void lcdSetRotation(bool landscape) {
   if (g_rotationSet && g_landscape == landscape) return;
+  g_clipShadowValid = false;
   g_rotationSet = true;
   g_landscape = landscape;
   g_screenWidth = landscape ? 320 : LCD_WIDTH;
@@ -189,6 +217,7 @@ static void lcdFillRect(int16_t x, int16_t y, int16_t w, int16_t h, uint16_t col
   if (y + h > (int16_t)g_screenHeight) h = g_screenHeight - y;
   if (w <= 0 || h <= 0) return;
 
+  g_clipShadowValid = false;
   lcdSetWindow((uint16_t)x, (uint16_t)y, (uint16_t)w, (uint16_t)h);
   digitalWrite(LCD_DC, HIGH);
   digitalWrite(LCD_CS, LOW);
@@ -212,6 +241,7 @@ static void lcdDrawFaceImage(uint8_t faceIndex) {
   LcdFaces::FaceImage face;
   memcpy_P(&face, &LcdFaces::kFaces[faceIndex], sizeof(face));
 
+  g_clipShadowValid = false;
   lcdSetWindow(0, 0, LcdFaces::kWidth, LcdFaces::kHeight);
   digitalWrite(LCD_DC, HIGH);
   digitalWrite(LCD_CS, LOW);
@@ -233,6 +263,7 @@ static void lcdDrawFaceImage(uint8_t faceIndex) {
 
 static void lcdDrawPixel(int16_t x, int16_t y, uint16_t color) {
   if (x < 0 || y < 0 || x >= (int16_t)g_screenWidth || y >= (int16_t)g_screenHeight) return;
+  g_clipShadowValid = false;
   lcdSetWindow((uint16_t)x, (uint16_t)y, 1, 1);
   lcdWriteData16(color);
 }
@@ -1043,9 +1074,12 @@ static bool openClipForPlayback(const String &clipId) {
   uint16_t height = readLe16(g_clipFile);
   g_clipFrameCount = readLe16(g_clipFile);
   g_clipFps = readLe16(g_clipFile);
-  if (width != 320 || height != 172 || g_clipFrameCount == 0 || g_clipFps == 0) {
+  if (width != C6_CLIP_WIDTH || height != C6_CLIP_HEIGHT || g_clipFrameCount == 0 ||
+      g_clipFps < C6_CLIP_MIN_FPS || g_clipFps > C6_CLIP_MAX_FPS) {
     stopClipPlayback();
-    Serial.printf("clip bad header: %s\n", clipId.c_str());
+    Serial.printf("clip bad header: %s size=%ux%u frames=%u fps=%u allowed=%d-%d\n",
+                  clipId.c_str(), width, height, g_clipFrameCount, g_clipFps,
+                  C6_CLIP_MIN_FPS, C6_CLIP_MAX_FPS);
     showScreen("CLIP", "BAD HEADER", clipId, COLOR_RED);
     return false;
   }
@@ -1055,8 +1089,107 @@ static bool openClipForPlayback(const String &clipId) {
   g_nextClipFrameMs = 0;
   g_eyeScreenActive = false;
   lcdSetRotation(true);
-  lcdFillScreen(COLOR_BLACK);
+  // A new clip starts from a black canvas. Loop rewinds bypass this function so
+  // they can diff the last frame directly against the first without a flash.
+  g_clipShadowValid = false;
   return true;
+}
+
+static void resetClipPerformance() {
+  g_clipPerfFrames = 0;
+  g_clipPerfDecodeUs = 0;
+  g_clipPerfLcdUs = 0;
+  g_clipPerfMaxFrameUs = 0;
+  g_clipPerfBudgetMisses = 0;
+  g_clipPerfLcdPixels = 0;
+  g_clipPerfLcdRects = 0;
+}
+
+static void recordClipPerformance(uint32_t decodeUs,
+                                  uint32_t lcdUs,
+                                  uint32_t frameUs,
+                                  uint32_t frameBudgetUs,
+                                  uint32_t lcdPixels,
+                                  uint32_t lcdRects) {
+  g_clipPerfFrames++;
+  g_clipPerfDecodeUs += decodeUs;
+  g_clipPerfLcdUs += lcdUs;
+  g_clipPerfLcdPixels += lcdPixels;
+  g_clipPerfLcdRects += lcdRects;
+  if (frameUs > g_clipPerfMaxFrameUs) g_clipPerfMaxFrameUs = frameUs;
+  if (frameUs > frameBudgetUs) g_clipPerfBudgetMisses++;
+  if (g_clipPerfFrames < C6_CLIP_PERF_REPORT_FRAMES) return;
+
+  Serial.printf(
+      "clip perf id=%s frames=%lu decode_avg=%luus lcd_avg=%luus "
+      "frame_max=%luus budget_miss=%lu lcd_pixels=%lu lcd_rects=%lu\n",
+      g_clipId.c_str(),
+      (unsigned long)g_clipPerfFrames,
+      (unsigned long)(g_clipPerfDecodeUs / g_clipPerfFrames),
+      (unsigned long)(g_clipPerfLcdUs / g_clipPerfFrames),
+      (unsigned long)g_clipPerfMaxFrameUs,
+      (unsigned long)g_clipPerfBudgetMisses,
+      (unsigned long)g_clipPerfLcdPixels,
+      (unsigned long)g_clipPerfLcdRects);
+  resetClipPerformance();
+}
+
+static uint32_t lcdWriteClipShadowRect(uint16_t x,
+                                       uint16_t y,
+                                       uint16_t w,
+                                       uint16_t h) {
+  if (w == 0 || h == 0) return 0;
+  lcdSetWindow(x, y, w, h);
+  lcdSpi.beginTransaction(SPISettings(C6_LCD_SPI_HZ, MSBFIRST, SPI_MODE0));
+  digitalWrite(LCD_DC, HIGH);
+  digitalWrite(LCD_CS, LOW);
+
+  if (x == 0 && w == C6_CLIP_WIDTH) {
+    const size_t offset = (size_t)y * C6_CLIP_WIDTH * 2;
+    lcdSpi.writeBytes(g_clipShadow + offset, (uint32_t)w * h * 2);
+  } else {
+    for (uint16_t row = 0; row < h; ++row) {
+      const size_t offset =
+          ((size_t)(y + row) * C6_CLIP_WIDTH + x) * 2;
+      lcdSpi.writeBytes(g_clipShadow + offset, (uint32_t)w * 2);
+    }
+  }
+
+  digitalWrite(LCD_CS, HIGH);
+  lcdSpi.endTransaction();
+  return (uint32_t)w * h;
+}
+
+static uint32_t lcdWriteDirtyClipTiles(
+    const bool dirtyTiles[C6_CLIP_TILE_ROWS][C6_CLIP_TILE_COLS],
+    uint32_t &rectCount) {
+  uint32_t pixelCount = 0;
+  rectCount = 0;
+  for (uint16_t tileY = 0; tileY < C6_CLIP_TILE_ROWS; ++tileY) {
+    int16_t runStart = -1;
+    for (uint16_t tileX = 0; tileX <= C6_CLIP_TILE_COLS; ++tileX) {
+      const bool dirty =
+          tileX < C6_CLIP_TILE_COLS && dirtyTiles[tileY][tileX];
+      if (dirty && runStart < 0) {
+        runStart = tileX;
+        continue;
+      }
+      if (dirty || runStart < 0) continue;
+
+      const uint16_t x = (uint16_t)runStart * C6_CLIP_TILE_SIZE;
+      const uint16_t xEnd =
+          min((uint16_t)(tileX * C6_CLIP_TILE_SIZE),
+              (uint16_t)C6_CLIP_WIDTH);
+      const uint16_t y = tileY * C6_CLIP_TILE_SIZE;
+      const uint16_t yEnd =
+          min((uint16_t)(y + C6_CLIP_TILE_SIZE),
+              (uint16_t)C6_CLIP_HEIGHT);
+      pixelCount += lcdWriteClipShadowRect(x, y, xEnd - x, yEnd - y);
+      rectCount++;
+      runStart = -1;
+    }
+  }
+  return pixelCount;
 }
 
 static bool drawNextClipFrame() {
@@ -1067,21 +1200,30 @@ static bool drawNextClipFrame() {
       showEyePair(g_currentEyeExpression);
       return false;
     }
-    String id = g_clipId;
-    if (!openClipForPlayback(id)) return false;
+    if (!g_clipFile.seek(14)) {
+      Serial.printf("clip rewind failed: %s\n", g_clipId.c_str());
+      stopClipPlayback();
+      showScreen("CLIP", "REWIND FAIL", "", COLOR_RED);
+      return false;
+    }
+    g_clipFrameIndex = 0;
   }
 
   if (g_clipFile.available() < 12) {
-    String id = g_clipId;
-    if (!openClipForPlayback(id)) return false;
+    Serial.printf("clip missing frame header frame=%u available=%d\n",
+                  g_clipFrameIndex, g_clipFile.available());
+    stopClipPlayback();
+    showScreen("CLIP", "TRUNC FRAME", String(g_clipFrameIndex), COLOR_RED);
+    return false;
   }
+  const uint32_t frameStartedUs = micros();
   uint16_t x = readLe16(g_clipFile);
   uint16_t y = readLe16(g_clipFile);
   uint16_t w = readLe16(g_clipFile);
   uint16_t h = readLe16(g_clipFile);
   uint16_t durationMs = readLe16(g_clipFile);
   uint16_t runCount = readLe16(g_clipFile);
-  if (w == 0 || h == 0 || x + w > 320 || y + h > 172) {
+  if (w == 0 || h == 0 || x + w > C6_CLIP_WIDTH || y + h > C6_CLIP_HEIGHT) {
     Serial.printf("clip bad rect frame=%u x=%u y=%u w=%u h=%u\n",
                   g_clipFrameIndex, x, y, w, h);
     stopClipPlayback();
@@ -1096,16 +1238,19 @@ static bool drawNextClipFrame() {
     return false;
   }
 
-  lcdSetWindow(x, y, w, h);
-  digitalWrite(LCD_DC, HIGH);
-  digitalWrite(LCD_CS, LOW);
+  bool dirtyTiles[C6_CLIP_TILE_ROWS][C6_CLIP_TILE_COLS] = {};
+  const bool forceFullRefresh = !g_clipShadowValid;
+  if (forceFullRefresh) {
+    memset(g_clipShadow, 0, sizeof(g_clipShadow));
+  }
+
   uint32_t writtenPixels = 0;
   const uint32_t expectedPixels = (uint32_t)w * h;
   for (uint16_t run = 0; run < runCount; ++run) {
     uint16_t count = readLe16(g_clipFile);
     uint16_t color = readLe16(g_clipFile);
     if (writtenPixels + count > expectedPixels) {
-      digitalWrite(LCD_CS, HIGH);
+      g_clipShadowValid = false;
       Serial.printf("clip bad pixels frame=%u written=%lu count=%u expected=%lu\n",
                     g_clipFrameIndex, (unsigned long)writtenPixels, count, (unsigned long)expectedPixels);
       stopClipPlayback();
@@ -1114,29 +1259,80 @@ static bool drawNextClipFrame() {
     }
     uint8_t high = color >> 8;
     uint8_t low = color & 0xFF;
-    for (uint16_t i = 0; i < count; ++i) {
-      lcdSpi.write(high);
-      lcdSpi.write(low);
+    uint16_t remaining = count;
+    while (remaining > 0) {
+      const uint16_t localY = writtenPixels / w;
+      const uint16_t localX = writtenPixels - (uint32_t)localY * w;
+      const uint16_t rowPixels = min(remaining, (uint16_t)(w - localX));
+      const uint16_t screenX = x + localX;
+      const uint16_t screenY = y + localY;
+      size_t offset =
+          ((size_t)screenY * C6_CLIP_WIDTH + screenX) * 2;
+      for (uint16_t i = 0; i < rowPixels; ++i, offset += 2) {
+        if (forceFullRefresh) {
+          g_clipShadow[offset] = high;
+          g_clipShadow[offset + 1] = low;
+        } else if (g_clipShadow[offset] != high ||
+                   g_clipShadow[offset + 1] != low) {
+          dirtyTiles[screenY / C6_CLIP_TILE_SIZE]
+                    [(screenX + i) / C6_CLIP_TILE_SIZE] = true;
+          g_clipShadow[offset] = high;
+          g_clipShadow[offset + 1] = low;
+        }
+      }
+      writtenPixels += rowPixels;
+      remaining -= rowPixels;
     }
-    writtenPixels += count;
   }
-  digitalWrite(LCD_CS, HIGH);
   if (writtenPixels != expectedPixels) {
+    g_clipShadowValid = false;
     Serial.printf("clip short pixels frame=%u written=%lu expected=%lu\n",
                   g_clipFrameIndex, (unsigned long)writtenPixels, (unsigned long)expectedPixels);
     stopClipPlayback();
     showScreen("CLIP", "SHORT PIX", String(g_clipFrameIndex), COLOR_RED);
     return false;
   }
+
+  const uint32_t decodedAtUs = micros();
+  uint32_t lcdRects = 0;
+  uint32_t lcdPixels = 0;
+  if (forceFullRefresh) {
+    lcdPixels =
+        lcdWriteClipShadowRect(0, 0, C6_CLIP_WIDTH, C6_CLIP_HEIGHT);
+    lcdRects = 1;
+  } else {
+    lcdPixels = lcdWriteDirtyClipTiles(dirtyTiles, lcdRects);
+  }
+  g_clipShadowValid = true;
+  const uint32_t renderedAtUs = micros();
+
   g_clipFrameIndex++;
-  g_nextClipFrameMs = millis() + (durationMs ? durationMs : (1000 / max((uint16_t)1, g_clipFps)));
+  const uint32_t frameDurationMs =
+      durationMs ? durationMs : (1000 / max((uint16_t)1, g_clipFps));
+  const uint32_t renderedAtMs = millis();
+  if (g_nextClipFrameMs == 0 ||
+      (int32_t)(renderedAtMs - g_nextClipFrameMs) >= (int32_t)frameDurationMs) {
+    // Rebase after a large miss instead of trying to render a burst of stale frames.
+    g_nextClipFrameMs = renderedAtMs + frameDurationMs;
+  } else {
+    // Keep the next deadline anchored to the prior deadline. This subtracts LCD
+    // draw time from the wait and avoids the old "draw time + frame time" drift.
+    g_nextClipFrameMs += frameDurationMs;
+  }
+  recordClipPerformance(
+      decodedAtUs - frameStartedUs,
+      renderedAtUs - decodedAtUs,
+      renderedAtUs - frameStartedUs,
+      frameDurationMs * 1000UL,
+      lcdPixels,
+      lcdRects);
   return true;
 }
 
 static void updateClipPlayback() {
   if (!g_clipPlaying) return;
   uint32_t now = millis();
-  if (g_nextClipFrameMs == 0 || now >= g_nextClipFrameMs) {
+  if (g_nextClipFrameMs == 0 || (int32_t)(now - g_nextClipFrameMs) >= 0) {
     drawNextClipFrame();
   }
 }
@@ -1299,6 +1495,7 @@ static bool handleClipLine(const String &line) {
       Serial.printf("clip play failed id=%s\n", clipId.c_str());
     } else {
       g_clipLoop = loopPlayback;
+      resetClipPerformance();
     }
     return true;
   }
@@ -1379,7 +1576,7 @@ static void lcdInit() {
   digitalWrite(LCD_BL, HIGH);
 
   lcdSpi.begin(LCD_SCLK, -1, LCD_MOSI, LCD_CS);
-  lcdSpi.setFrequency(40000000);
+  lcdSpi.setFrequency(C6_LCD_SPI_HZ);
 
   digitalWrite(LCD_RST, HIGH);
   delay(20);
