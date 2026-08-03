@@ -26,6 +26,9 @@ LampGo backend after flashing.
 
 - Single eye package: 256KiB maximum.
 - Uploads are written to `.tmp`, checked for size and SHA256, then committed.
+- Size/SHA/error metadata belongs only to the matching active `.tmp` upload;
+  installed clips never inherit validation state from the most recent sync.
+- A chunk or commit without a matching active `clip_begin` is rejected.
 - A failed upload keeps the previous installed clip.
 - Space exhaustion rejects the new clip; no existing clip is evicted.
 - `once` playback returns to the default eye after one pass; `loop` repeats.

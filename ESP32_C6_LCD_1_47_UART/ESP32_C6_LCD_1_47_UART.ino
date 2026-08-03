@@ -4,6 +4,7 @@
 #include <SPI.h>
 #include <ctype.h>
 #include <mbedtls/sha256.h>
+#include "clip_validation_scope.h"
 #include "lcd_faces.h"
 
 // Waveshare ESP32-C6-LCD-1.47 LCD pins (ST7789, 172x320)
@@ -501,6 +502,24 @@ static void closeSyncFile() {
   }
 }
 
+static void resetClipSyncState(bool removeTemporaryFile) {
+  closeSyncFile();
+  if (removeTemporaryFile && g_syncClipId.length()) {
+    LittleFS.remove(clipTempPath(g_syncClipId));
+  }
+  g_syncClipId = "";
+  g_syncExpectedBytes = 0;
+  g_syncExpectedSha256 = "";
+  g_syncReceivedBytes = 0;
+  g_syncHadError = false;
+  g_syncLastError = "";
+  g_syncInProgress = false;
+  g_syncErrorShown = false;
+  g_syncFirstChunkLogged = false;
+  g_syncWriteOffset = 0;
+  g_syncLastProgressPct = 255;
+}
+
 static void debugLogAppend(const String &line) {
   if (!g_fsReady) return;
   File existing = LittleFS.open(CLIP_DEBUG_LOG_PATH, "r");
@@ -864,25 +883,6 @@ static void updateBlink() {
 
 static bool appendClipHexChunk(const String &clipId, uint32_t offset, const String &hexData) {
   String path = clipTempPath(clipId);
-  if (offset == 0) {
-    if (!g_syncInProgress || g_syncClipId != clipId || g_syncWriteOffset != 0) {
-      closeSyncFile();
-      LittleFS.remove(path);
-      g_syncClipId = clipId;
-      g_syncExpectedBytes = 0;
-      g_syncExpectedSha256 = "";
-      g_syncReceivedBytes = 0;
-      g_syncHadError = false;
-      g_syncLastError = "";
-      g_validatedClipId = "";
-      g_syncInProgress = true;
-      g_syncErrorShown = false;
-      g_syncFirstChunkLogged = false;
-      g_syncWriteOffset = 0;
-      g_syncLastProgressPct = 255;
-      debugLogAppend(String("CHUNK_RESTART id=") + clipId);
-    }
-  }
   if (!g_syncFirstChunkLogged) {
     g_syncFirstChunkLogged = true;
     String msg = String("FIRST_CHUNK id=") + clipId;
@@ -894,7 +894,8 @@ static bool appendClipHexChunk(const String &clipId, uint32_t offset, const Stri
     msg += hexData.length();
     debugLogAppend(msg);
   }
-  if (g_syncClipId.length() && g_syncClipId != clipId) {
+  if (!ClipValidationScope::isActiveSyncForClip(
+          g_syncClipId.c_str(), clipId.c_str(), g_syncInProgress)) {
     Serial.printf("clip chunk reject id=%s active=%s offset=%lu\n",
                   clipId.c_str(), g_syncClipId.c_str(), (unsigned long)offset);
     if (!g_syncErrorShown) {
@@ -905,9 +906,6 @@ static bool appendClipHexChunk(const String &clipId, uint32_t offset, const Stri
       msg += offset;
       debugLogAppend(msg);
     }
-    g_syncHadError = true;
-    g_syncLastError = "BAD CHUNK";
-    closeSyncFile();
     return false;
   }
   if (g_syncWriteOffset != offset || (hexData.length() % 2) != 0) {
@@ -986,8 +984,18 @@ static bool appendClipHexChunk(const String &clipId, uint32_t offset, const Stri
   return true;
 }
 
-static bool validateClipFile(const String &clipId, String &status, String &detail, const String &pathOverride = "") {
+static bool validateClipFile(const String &clipId,
+                             String &status,
+                             String &detail,
+                             const String &pathOverride = "",
+                             bool validateSyncPayload = false) {
   String path = pathOverride.length() ? pathOverride : clipPath(clipId);
+  const bool useSyncExpectations = ClipValidationScope::shouldUseSyncExpectations(
+      g_syncClipId.c_str(),
+      clipId.c_str(),
+      g_syncInProgress,
+      validateSyncPayload && pathOverride.length() > 0);
+  const uint32_t expectedBytes = useSyncExpectations ? g_syncExpectedBytes : 0;
   File file = LittleFS.open(path, "r");
   if (!file) {
     status = "MISSING";
@@ -997,19 +1005,23 @@ static bool validateClipFile(const String &clipId, String &status, String &detai
   uint32_t actualSize = file.size();
   file.close();
 
-  if (g_syncHadError) {
+  // Size/SHA/error are transient properties of the staged upload.  Applying
+  // them to an installed clip makes the most recently synced clip poison
+  // playback of every other cached clip (and a failed replacement poison the
+  // previous version of the same clip).
+  if (useSyncExpectations && g_syncHadError) {
     status = g_syncLastError.length() ? g_syncLastError : "SYNC ERROR";
-    detail = clipDiagLine(actualSize, g_syncExpectedBytes);
+    detail = clipDiagLine(actualSize, expectedBytes);
     debugLogAppend(String("VALIDATE_SYNC_ERROR id=") + clipId + " status=" + status + " detail=" + detail);
     return false;
   }
-  if (g_syncExpectedBytes > 0 && actualSize != g_syncExpectedBytes) {
+  if (expectedBytes > 0 && actualSize != expectedBytes) {
     status = "BAD SIZE";
-    detail = clipDiagLine(actualSize, g_syncExpectedBytes);
+    detail = clipDiagLine(actualSize, expectedBytes);
     debugLogAppend(String("VALIDATE_BAD_SIZE id=") + clipId + " detail=" + detail);
     return false;
   }
-  if (g_syncExpectedSha256.length()) {
+  if (useSyncExpectations && g_syncExpectedSha256.length()) {
     String actualSha;
     uint32_t shaSize = 0;
     if (!fileSha256Hex(path, actualSha, &shaSize)) {
@@ -1034,7 +1046,7 @@ static bool validateClipFile(const String &clipId, String &status, String &detai
   }
 
   status = "READY";
-  detail = clipDiagLine(actualSize, g_syncExpectedBytes);
+  detail = clipDiagLine(actualSize, expectedBytes);
   debugLogAppend(String("VALIDATE_READY id=") + clipId + " detail=" + detail);
   return true;
 }
@@ -1343,7 +1355,7 @@ static bool handleClipLine(const String &line) {
   String clipId = jsonValue(line, "clip_id");
   if (type == "clip_begin") {
     stopClipPlayback();
-    closeSyncFile();
+    resetClipSyncState(true);
     uint32_t lcdBytes = (uint32_t)jsonNumber(line, "lcd_bytes", 0);
     int fps = (int)jsonNumber(line, "fps", 0);
     int frameCount = (int)jsonNumber(line, "frame_count", 0);
@@ -1382,6 +1394,7 @@ static bool handleClipLine(const String &line) {
       debugLogAppend(String("ERROR TOO_LARGE id=") + clipId + " bytes=" + String(lcdBytes));
       showScreen("CLIP", "TOO LARGE", clipId, COLOR_RED);
       sendClipAck(clipId, "begin", false, 0, g_syncLastError);
+      resetClipSyncState(true);
       return true;
     }
     const uint32_t maxClipBytes = 256UL * 1024UL;
@@ -1410,6 +1423,7 @@ static bool handleClipLine(const String &line) {
                      " installed=" + String(installedBytes) + " count=" + String(installedCount));
       showScreen("CLIP", "NO SPACE", clipId, COLOR_RED);
       sendClipAck(clipId, "begin", false, 0, g_syncLastError);
+      resetClipSyncState(true);
       return true;
     }
     LittleFS.remove(clipTempPath(clipId));
@@ -1421,6 +1435,7 @@ static bool handleClipLine(const String &line) {
       debugLogAppend(String("ERROR OPEN_FAIL_BEGIN id=") + clipId);
       showScreen("CLIP", "OPEN FAIL", clipId, COLOR_RED);
       sendClipAck(clipId, "begin", false, 0, g_syncLastError);
+      resetClipSyncState(true);
       return true;
     }
     showClipSyncProgress(true);
@@ -1430,6 +1445,13 @@ static bool handleClipLine(const String &line) {
   if (type == "clip_chunk") {
     uint32_t offset = (uint32_t)jsonNumber(line, "offset", 0);
     String data = jsonValue(line, "data");
+    if (!ClipValidationScope::isActiveSyncForClip(
+            g_syncClipId.c_str(), clipId.c_str(), g_syncInProgress)) {
+      String error = g_syncInProgress ? "BAD CHUNK ID" : "NO ACTIVE SYNC";
+      debugLogAppend(String("CHUNK_REJECT id=") + clipId + " active=" + g_syncClipId + " error=" + error);
+      sendClipAck(clipId, "chunk", false, 0, error);
+      return true;
+    }
     bool chunkOk = appendClipHexChunk(clipId, offset, data);
     if (!chunkOk) {
       if (!g_syncErrorShown) {
@@ -1439,14 +1461,22 @@ static bool handleClipLine(const String &line) {
       }
     }
     sendClipAck(clipId, "chunk", chunkOk, g_syncWriteOffset, chunkOk ? String("") : g_syncLastError);
+    if (!chunkOk) resetClipSyncState(true);
     return true;
   }
   if (type == "clip_commit") {
+    if (!ClipValidationScope::isActiveSyncForClip(
+            g_syncClipId.c_str(), clipId.c_str(), g_syncInProgress)) {
+      String error = g_syncInProgress ? "BAD COMMIT ID" : "NO ACTIVE SYNC";
+      debugLogAppend(String("COMMIT_REJECT id=") + clipId + " active=" + g_syncClipId + " error=" + error);
+      sendClipAck(clipId, "commit", false, 0, error);
+      return true;
+    }
     closeSyncFile();
     debugLogAppend(String("COMMIT_RX id=") + clipId + " received=" + String(g_syncReceivedBytes) + " expected=" + String(g_syncExpectedBytes));
     String status, detail;
     String temporaryPath = clipTempPath(clipId);
-    if (validateClipFile(clipId, status, detail, temporaryPath)) {
+    if (validateClipFile(clipId, status, detail, temporaryPath, true)) {
       String finalPath = clipPath(clipId);
       String backupPath = finalPath + ".bak";
       LittleFS.remove(backupPath);
@@ -1457,6 +1487,7 @@ static bool handleClipLine(const String &line) {
         debugLogAppend(String("COMMIT_FAIL id=") + clipId + " status=BACKUP_FAIL");
         showScreen("CLIP", "BACKUP FAIL", clipId, COLOR_RED);
         sendClipAck(clipId, "commit", false, g_syncReceivedBytes, "BACKUP FAIL");
+        resetClipSyncState(true);
         return true;
       }
       if (!LittleFS.rename(temporaryPath, finalPath)) {
@@ -1466,6 +1497,7 @@ static bool handleClipLine(const String &line) {
         debugLogAppend(String("COMMIT_FAIL id=") + clipId + " status=RENAME_FAIL");
         showScreen("CLIP", "RENAME FAIL", clipId, COLOR_RED);
         sendClipAck(clipId, "commit", false, g_syncReceivedBytes, "RENAME FAIL");
+        resetClipSyncState(true);
         return true;
       }
       LittleFS.remove(backupPath);
@@ -1476,6 +1508,7 @@ static bool handleClipLine(const String &line) {
       Serial.printf("clip ready id=%s size=%s sha=%s\n",
                     clipId.c_str(), detail.c_str(), g_syncExpectedSha256.c_str());
       sendClipAck(clipId, "commit", true, g_syncReceivedBytes);
+      resetClipSyncState(false);
     } else {
       LittleFS.remove(temporaryPath);
       g_validatedClipId = "";
@@ -1485,6 +1518,7 @@ static bool handleClipLine(const String &line) {
       Serial.printf("clip commit failed id=%s status=%s detail=%s expected_sha=%s\n",
                     clipId.c_str(), status.c_str(), detail.c_str(), g_syncExpectedSha256.c_str());
       sendClipAck(clipId, "commit", false, g_syncReceivedBytes, status);
+      resetClipSyncState(false);
     }
     return true;
   }
