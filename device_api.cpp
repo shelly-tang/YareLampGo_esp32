@@ -22,6 +22,8 @@
 namespace {
 
 const char *FIRMWARE_VERSION = "lampgo-cam 0.6.0";
+constexpr uint32_t kExpressionMinDurationMs = 1000;
+constexpr uint32_t kExpressionMaxDurationMs = 6000;
 
 bool appendRaw(char *dst, size_t dstLen, size_t *used, const char *src) {
   if (!dst || !used || !src || *used >= dstLen) return false;
@@ -1038,9 +1040,9 @@ esp_err_t deviceExpressionPlayHandler(httpd_req_t *req) {
   bool loopPlayback = playback.length() == 0 || playback == "loop";
   const cJSON *durationItem = cJSON_GetObjectItemCaseSensitive(doc, "duration_ms");
   uint32_t durationMs = cJSON_IsNumber(durationItem) ? (uint32_t)durationItem->valuedouble : 3000;
-  if (durationMs < 1000 || durationMs > 3500) {
+  if (durationMs < kExpressionMinDurationMs || durationMs > kExpressionMaxDurationMs) {
     cJSON_Delete(doc);
-    return sendBadRequestJson(req, "duration_ms must be 1000-3500");
+    return sendBadRequestJson(req, "duration_ms must be 1000-6000");
   }
 
   const cJSON *modeItem = cJSON_GetObjectItemCaseSensitive(doc, "led_mode");
