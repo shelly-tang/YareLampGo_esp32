@@ -4,7 +4,9 @@ Firmware for the LampGo ESP32 camera, microphone, speaker, LED, and WiFi provisi
 
 中文烧录指南：[`README.zh-CN.md`](README.zh-CN.md)
 
-The target board is `XIAO_ESP32S3` with OPI PSRAM enabled.
+The legacy target is `XIAO_ESP32S3` with OPI PSRAM enabled. The new integrated
+ESP32-P4 head-board runtime lives in [`ESP32_P4_HEAD/`](ESP32_P4_HEAD/) and has
+its own build and safety instructions.
 
 ## License
 
