@@ -47,6 +47,10 @@ bool DisplayController::begin() {
   ioConfig.spi_mode = 0;
   ioConfig.pclk_hz = 40 * 1000 * 1000;
   ioConfig.trans_queue_depth = 10;
+  // ESP32-P4 can feed SPI DMA directly from its AXI PSRAM. Without this flag,
+  // esp_lcd allocates an equally large internal-SRAM bounce buffer for each
+  // full-screen transfer, starving the independent I2S DMA channels.
+  ioConfig.flags.psram_dma_direct = true;
   ioConfig.lcd_cmd_bits = 8;
   ioConfig.lcd_param_bits = 8;
   if (esp_lcd_new_panel_io_spi(SPI2_HOST, &ioConfig, &io) != ESP_OK) {

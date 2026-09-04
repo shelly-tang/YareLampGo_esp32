@@ -7,7 +7,7 @@
 
 namespace BoardConfig {
 
-constexpr char kFirmwareVersion[] = "p4-head-0.1.0";
+constexpr char kFirmwareVersion[] = "p4-head-0.1.1";
 constexpr char kMotionProtocol[] = "lampgo-motion-v1";
 
 constexpr int kServoTx = 31;
@@ -40,10 +40,10 @@ constexpr int kCameraD4 = 6;
 constexpr int kCameraD5 = 7;
 constexpr int kCameraD6 = 8;
 constexpr int kCameraD7 = 9;
-constexpr int kCameraXclk = 10;
-constexpr int kCameraPclk = 11;
-constexpr int kCameraVsync = 12;
-constexpr int kCameraHref = 13;
+constexpr int kCameraPclk = 10;
+constexpr int kCameraVsync = 11;
+constexpr int kCameraHref = 12;
+constexpr int kCameraXclk = 13;
 constexpr int kCameraSda = 20;
 constexpr int kCameraScl = 21;
 constexpr int kCameraReset = 22;
