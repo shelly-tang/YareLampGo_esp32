@@ -106,7 +106,10 @@ void setup() {
   }
 
   gHostname = "lampgo-p4-" + deviceSuffix();
-  const bool storageReady = LittleFS.begin(false);
+  // A new custom partition table leaves the asset filesystem unformatted.
+  // Format only that partition on first mount failure; Wi-Fi and pairing NVS
+  // live in separate partitions and are intentionally preserved.
+  const bool storageReady = LittleFS.begin(true);
   Serial.printf("[STORAGE] LittleFS ready=%d\n", storageReady);
   Serial.printf("[PAIRING] ready=%d paired=%d\n", gPairing.begin(), gPairing.isPaired());
 

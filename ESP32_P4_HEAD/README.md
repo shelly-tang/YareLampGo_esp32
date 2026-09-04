@@ -38,6 +38,10 @@ partition. This P4 image deliberately does not bundle a WakeNet model
 partition; full-duplex microphone/speaker streaming and ESP-SR AEC are
 independent of wake-word detection.
 
+On the first boot after installing this partition table, an uninitialized or
+invalid LittleFS asset partition is formatted automatically. Wi-Fi and pairing
+state live in NVS and are not part of that format operation.
+
 ## Network and ports
 
 - HTTP device API and `/capture`: port `80`
