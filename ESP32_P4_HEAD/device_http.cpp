@@ -6,6 +6,14 @@
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_heap_caps.h>
+
+#if __has_include(<esp32-hal-hosted.h>)
+#include <esp32-hal-hosted.h>
+#define LAMPGO_HAS_ESP_HOSTED_DIAGNOSTICS 1
+#else
+#define LAMPGO_HAS_ESP_HOSTED_DIAGNOSTICS 0
+#endif
 
 #include "board_config.h"
 #include "motion_protocol.h"
@@ -19,6 +27,33 @@ constexpr char kTokenHeader[] = "X-Lampgo-Token";
 constexpr char kClipIdHeader[] = "X-Lampgo-Clip-Id";
 constexpr char kEffectIdHeader[] = "X-Lampgo-Effect-Id";
 constexpr char kUploadPhaseHeader[] = "X-Lampgo-Upload-Phase";
+
+void addHostedDiagnostics(JsonDocument& response) {
+  JsonObject hosted = response["hosted"].to<JsonObject>();
+  hosted["internal_dma_free"] = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  hosted["internal_dma_largest"] =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  hosted["internal_dma_low_water"] =
+      heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+
+#if LAMPGO_HAS_ESP_HOSTED_DIAGNOSTICS
+  uint32_t hostMajor = 0;
+  uint32_t hostMinor = 0;
+  uint32_t hostPatch = 0;
+  uint32_t slaveMajor = 0;
+  uint32_t slaveMinor = 0;
+  uint32_t slavePatch = 0;
+  hostedGetHostVersion(&hostMajor, &hostMinor, &hostPatch);
+  hostedGetSlaveVersion(&slaveMajor, &slaveMinor, &slavePatch);
+  hosted["initialized"] = hostedIsInitialized();
+  hosted["host_version"] = String(hostMajor) + "." + String(hostMinor) + "." + String(hostPatch);
+  hosted["slave_version"] = String(slaveMajor) + "." + String(slaveMinor) + "." + String(slavePatch);
+#else
+  hosted["initialized"] = false;
+  hosted["host_version"] = "unavailable";
+  hosted["slave_version"] = "unavailable";
+#endif
+}
 
 uint32_t parseColor(String value) {
   value.trim();
@@ -226,6 +261,7 @@ void DeviceHttp::handleStatus() {
   response["paired_owner_label"] = pairing_.ownerLabel();
   response["free_heap"] = ESP.getFreeHeap();
   response["free_psram"] = ESP.getFreePsram();
+  addHostedDiagnostics(response);
   response["mic_streaming"] = audio_.microphoneReady() && audio_.microphoneEnabled();
   response["wake_ready"] = false;
   response["wake_event_clients"] = 0;
