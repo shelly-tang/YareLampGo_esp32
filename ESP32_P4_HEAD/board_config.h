@@ -19,6 +19,11 @@ constexpr int kLedData = 53;
 constexpr uint16_t kLedWidth = 54;
 constexpr uint16_t kLedHeight = 9;
 constexpr uint16_t kLedCount = kLedWidth * kLedHeight;
+// Logical pixel (0, 0) is the top-left corner when the lamp is viewed from
+// the front.  The diagnostic endpoint renders fixed *physical* indices so
+// this transform can be confirmed before changing either flag.
+constexpr bool kLedMirrorX = false;
+constexpr bool kLedMirrorY = false;
 constexpr uint8_t kLedSafeBrightness = 32;
 // Conservative until whole-board current and thermal tests establish a
 // product ceiling. One equivalent full-white WS2812 pixel is about 60 mA.

@@ -89,6 +89,17 @@ void PixelStrip::showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t
   xQueueOverwrite(queue_, &command);
 }
 
+void PixelStrip::showTopologyTest(uint8_t brightness, uint32_t startAtMs) {
+  if (!queue_) return;
+  Command command{};
+  command.type = CommandType::kTopologyTest;
+  // This is a calibration image, not illumination.  Keep it visibly dim even
+  // if a caller accidentally sends a larger brightness value.
+  command.brightness = static_cast<uint8_t>(std::max<int>(1, std::min<int>(brightness, 8)));
+  command.startAtMs = startAtMs;
+  xQueueOverwrite(queue_, &command);
+}
+
 void PixelStrip::taskEntry(void* context) {
   static_cast<PixelStrip*>(context)->taskLoop();
 }
@@ -104,6 +115,7 @@ void PixelStrip::taskLoop() {
       brightness_ = command.brightness;
       effectActive_ = command.type == CommandType::kEffect && openEffect(command.path, command.loop);
       clockActive_ = command.type == CommandType::kClock;
+      topologyTestActive_ = command.type == CommandType::kTopologyTest;
       if (clockActive_) {
         clockHour_ = command.hour;
         clockMinute_ = command.minute;
@@ -115,7 +127,9 @@ void PixelStrip::taskLoop() {
     }
     const uint32_t now = millis();
     if (static_cast<int32_t>(now - nextFrame) >= 0 && static_cast<int32_t>(now - startAt) >= 0) {
-      if (clockActive_) {
+      if (topologyTestActive_) {
+        renderTopologyTest();
+      } else if (clockActive_) {
         renderClock(phase++);
       } else if (effectActive_) {
         renderEffect(phase++);
@@ -165,6 +179,19 @@ void PixelStrip::renderClock(uint32_t phase) {
   }
 }
 
+void PixelStrip::renderTopologyTest() {
+  clear();
+  // Colors identify serial positions, not screen coordinates:
+  // They expose the first physical corner and the direction of the first two
+  // and final rows even when the logical transform is currently wrong.
+  setPixelPhysical(0, 255, 0, 0);
+  setPixelPhysical(BoardConfig::kLedWidth - 1, 0, 255, 0);
+  setPixelPhysical(BoardConfig::kLedWidth, 0, 0, 255);
+  setPixelPhysical(2 * BoardConfig::kLedWidth - 1, 255, 255, 0);
+  setPixelPhysical((BoardConfig::kLedHeight - 1) * BoardConfig::kLedWidth, 0, 255, 255);
+  setPixelPhysical(BoardConfig::kLedCount - 1, 255, 0, 255);
+}
+
 bool PixelStrip::openEffect(const char* path, bool loop) {
   File file = LittleFS.open(path, "r");
   if (!file || file.size() < kEffectHeaderBytes || file.size() > sizeof(effectData_)) return false;
@@ -204,17 +231,26 @@ void PixelStrip::renderEffect(uint32_t phase) {
   const uint8_t tick = effectLoop_ ? phase % effectTicks_ : std::min<uint32_t>(phase, effectTicks_ - 1);
   const uint8_t frameIndex = effectData_[effectTimelineOffset_ + tick];
   const uint8_t* frame = effectData_ + effectFramesOffset_ + frameIndex * effectFrameBytes_;
+  // LEF1 v1 is the historical 447-pixel S3 layout.  Its bytes are in wired
+  // order (bottom/right-facing), not editor row order.  Decode that legacy
+  // transform first, then centre its 51-column canvas on the P4's 54-column
+  // panel.  Treating the bytes as top-left rows was the source of rotated and
+  // scrambled imported images on the new board.
   uint16_t legacyIndex = 0;
-  for (uint8_t row = 0; row < 9; ++row) {
-    const uint8_t rowLength = kLegacyRowLengths[row];
-    const uint8_t leftPad = (BoardConfig::kLedWidth - rowLength) / 2;
-    for (uint8_t column = 0; column < rowLength; ++column, ++legacyIndex) {
+  constexpr int kLegacyCanvasWidth = 51;
+  constexpr int kP4LeftPad = (BoardConfig::kLedWidth - kLegacyCanvasWidth) / 2;
+  for (uint8_t wiredRow = 0; wiredRow < BoardConfig::kLedHeight; ++wiredRow) {
+    const uint8_t rowLength = kLegacyRowLengths[wiredRow];
+    const uint8_t legacyLeftPad = (kLegacyCanvasWidth - rowLength) / 2;
+    for (uint8_t wiredColumn = 0; wiredColumn < rowLength; ++wiredColumn, ++legacyIndex) {
       const uint8_t packed = frame[legacyIndex / 2];
       const uint8_t paletteIndex =
           (legacyIndex & 1) ? packed & 0x0F : static_cast<uint8_t>(packed >> 4);
       if (paletteIndex >= effectColors_) continue;
       const uint8_t* color = effectData_ + effectPaletteOffset_ + paletteIndex * 3U;
-      setPixel(row, leftPad + column, color[0], color[1], color[2]);
+      const int sourceRow = BoardConfig::kLedHeight - 1 - wiredRow;
+      const int sourceColumn = kLegacyCanvasWidth - 1 - (legacyLeftPad + wiredColumn);
+      setPixel(sourceRow, kP4LeftPad + sourceColumn, color[0], color[1], color[2]);
     }
   }
 }
@@ -349,10 +385,13 @@ void PixelStrip::setPixel(int row, int column, uint8_t red, uint8_t green, uint8
   if (row < 0 || row >= BoardConfig::kLedHeight || column < 0 || column >= BoardConfig::kLedWidth) {
     return;
   }
-  // The board is confirmed serpentine. Origin/mirroring still need one visual
-  // acceptance pass; keep the transform centralized here for a one-line fix.
-  const int physicalColumn = (row & 1) ? BoardConfig::kLedWidth - 1 - column : column;
-  setPixelPhysical(row * BoardConfig::kLedWidth + physicalColumn, red, green, blue);
+  // The panel is row-serpentine.  Its front-facing origin is calibrated with
+  // renderTopologyTest(); mirror controls remain the only board-specific
+  // transform instead of leaking orientation assumptions into renderers.
+  const int logicalRow = BoardConfig::kLedMirrorY ? BoardConfig::kLedHeight - 1 - row : row;
+  const int logicalColumn = BoardConfig::kLedMirrorX ? BoardConfig::kLedWidth - 1 - column : column;
+  const int physicalColumn = (logicalRow & 1) ? BoardConfig::kLedWidth - 1 - logicalColumn : logicalColumn;
+  setPixelPhysical(logicalRow * BoardConfig::kLedWidth + physicalColumn, red, green, blue);
 }
 
 void PixelStrip::setPixelPhysical(int index, uint8_t red, uint8_t green, uint8_t blue) {

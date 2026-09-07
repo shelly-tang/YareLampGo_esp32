@@ -17,6 +17,7 @@ class ExpressionCoordinator {
             const String& ledEffectId, uint8_t brightness, bool loop);
   void setBrightness(uint8_t brightness);
   void showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness);
+  void showLedTopologyTest(uint8_t brightness);
   void stop();
   uint8_t currentMode() const { return currentMode_; }
   const String& currentEyeClip() const { return currentEyeClip_; }

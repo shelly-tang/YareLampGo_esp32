@@ -3,6 +3,8 @@
 
 #include "expression_coordinator.h"
 
+#include <algorithm>
+
 #include <LittleFS.h>
 
 #include "board_config.h"
@@ -61,6 +63,14 @@ void ExpressionCoordinator::showClock(uint8_t hour, uint8_t minute, uint32_t col
                                       uint8_t brightness) {
   pixels_.showClock(hour, minute, color, brightness, millis() + 20);
   currentBrightness_ = brightness;
+}
+
+void ExpressionCoordinator::showLedTopologyTest(uint8_t brightness) {
+  pixels_.showTopologyTest(brightness, millis() + 20);
+  currentMode_ = 0;
+  currentEyeClip_.clear();
+  currentLedEffect_.clear();
+  currentBrightness_ = std::max<uint8_t>(1, std::min<uint8_t>(brightness, 8));
 }
 
 void ExpressionCoordinator::stop() {

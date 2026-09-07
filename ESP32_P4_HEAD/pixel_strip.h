@@ -15,13 +15,16 @@ class PixelStrip {
                   uint32_t startAtMs = 0);
   void showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness,
                  uint32_t startAtMs = 0);
+  // Shows fixed physical LED indices for a visual wiring/orientation check.
+  // It never passes through the logical mirror transform.
+  void showTopologyTest(uint8_t brightness, uint32_t startAtMs = 0);
   void off(uint32_t startAtMs = 0) { showMode(0, 1, startAtMs); }
   bool ready() const { return queue_ != nullptr && symbols_ != nullptr; }
   uint8_t mode() const { return mode_; }
   uint8_t brightness() const { return brightness_; }
 
  private:
-  enum class CommandType : uint8_t { kMode, kEffect, kClock };
+  enum class CommandType : uint8_t { kMode, kEffect, kClock, kTopologyTest };
   struct Command {
     CommandType type;
     uint8_t mode;
@@ -40,6 +43,7 @@ class PixelStrip {
   bool openEffect(const char* path, bool loop);
   void renderEffect(uint32_t phase);
   void renderClock(uint32_t phase);
+  void renderTopologyTest();
   void transmit();
   void clear();
   void setPixel(int row, int column, uint8_t red, uint8_t green, uint8_t blue);
@@ -62,6 +66,7 @@ class PixelStrip {
   bool effectActive_ = false;
   bool effectLoop_ = false;
   bool clockActive_ = false;
+  bool topologyTestActive_ = false;
   uint32_t clockColor_ = 0xFFFFFF;
   uint8_t clockHour_ = 0;
   uint8_t clockMinute_ = 0;

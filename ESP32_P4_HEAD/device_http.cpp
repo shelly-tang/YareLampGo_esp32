@@ -239,8 +239,13 @@ void DeviceHttp::handleStatus() {
   response["led_driver"] = "p4-rmt-direct";
   response["led_pixel_pin"] = BoardConfig::kLedData;
   response["led_pixel_count"] = BoardConfig::kLedCount;
+  response["led_width"] = BoardConfig::kLedWidth;
+  response["led_height"] = BoardConfig::kLedHeight;
   response["led_panel_count"] = 1;
   response["led_output_ok"] = expressions_.ledReady();
+  response["lcd_width"] = BoardConfig::kLcdWidth;
+  response["lcd_height"] = BoardConfig::kLcdHeight;
+  response["lcd_ready"] = expressions_.displayReady();
   JsonObject capabilities = response["capabilities"].to<JsonObject>();
   capabilities["motion_ws"] = true;
   capabilities["servo_count"] = BoardConfig::kServoCount;
@@ -372,7 +377,10 @@ void DeviceHttp::handleLed() {
     sendError(403, "pairing mismatch");
     return;
   }
-  if (!body["enabled"].isNull() && !body["enabled"].as<bool>()) {
+  const String diagnostic = body["diagnostic"] | "";
+  if (diagnostic == "topology") {
+    expressions_.showLedTopologyTest(body["brightness"] | 8);
+  } else if (!body["enabled"].isNull() && !body["enabled"].as<bool>()) {
     expressions_.stop();
   } else if (!body["expression"].isNull() || !body["mode"].isNull() ||
              !body["led_mode"].isNull() || !body["clip_id"].isNull()) {
@@ -391,6 +399,7 @@ void DeviceHttp::handleLed() {
   JsonDocument response;
   response["ok"] = true;
   response["mode"] = expressions_.currentMode();
+  if (diagnostic == "topology") response["diagnostic"] = "topology";
   sendJson(200, response);
 }
 
