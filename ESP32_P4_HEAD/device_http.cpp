@@ -31,9 +31,9 @@ uint32_t parseColor(String value) {
 
 DeviceHttp::DeviceHttp(PairingStore& pairing, ServoExecutor& servos,
                        ExpressionCoordinator& expressions, CameraController& camera,
-                       AudioBridge& audio, const String& hostname)
+                       AudioBridge& audio, AssetUploadServer& assets, const String& hostname)
     : pairing_(pairing), servos_(servos), expressions_(expressions), camera_(camera),
-      audio_(audio), hostname_(hostname), server_(BoardConfig::kHttpPort) {}
+      audio_(audio), assets_(assets), hostname_(hostname), server_(BoardConfig::kHttpPort) {}
 
 void DeviceHttp::begin() {
   // Raw body callbacks run before WebServer parses query arguments.  Retain
@@ -214,6 +214,7 @@ void DeviceHttp::handleStatus() {
   response["firmware"] = BoardConfig::kFirmwareVersion;
   response["platform"] = "esp32-p4";
   response["motion_port"] = BoardConfig::kMotionWsPort;
+  response["asset_upload_port"] = assets_.ready() ? BoardConfig::kAssetUploadPort : 0;
   response["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   response["network_mode"] = WiFi.status() == WL_CONNECTED ? "sta" : "softap";
   response["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
@@ -258,6 +259,7 @@ void DeviceHttp::handleStatus() {
   response["lcd_ready"] = expressions_.displayReady();
   JsonObject capabilities = response["capabilities"].to<JsonObject>();
   capabilities["motion_ws"] = true;
+  capabilities["asset_upload_port"] = assets_.ready() ? BoardConfig::kAssetUploadPort : 0;
   capabilities["servo_count"] = BoardConfig::kServoCount;
   capabilities["led_pixels"] = BoardConfig::kLedCount;
   capabilities["lcd_width"] = BoardConfig::kLcdWidth;

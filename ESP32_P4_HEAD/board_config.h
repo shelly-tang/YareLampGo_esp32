@@ -64,6 +64,7 @@ constexpr uint32_t kAudioSampleRate = 16000;
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kAudioWsPort = 81;
 constexpr uint16_t kMotionWsPort = 82;
+constexpr uint16_t kAssetUploadPort = 83;
 constexpr char kSetupSsidPrefix[] = "Lampgo-P4-Setup-";
 constexpr char kSetupPassword[] = "lampgo-p4-setup";
 

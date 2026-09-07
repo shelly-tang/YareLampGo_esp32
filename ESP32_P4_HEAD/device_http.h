@@ -8,6 +8,7 @@
 #include <WebServer.h>
 
 #include "audio_bridge.h"
+#include "asset_upload_server.h"
 #include "camera_controller.h"
 #include "expression_coordinator.h"
 #include "pairing_store.h"
@@ -16,7 +17,8 @@
 class DeviceHttp {
  public:
   DeviceHttp(PairingStore& pairing, ServoExecutor& servos, ExpressionCoordinator& expressions,
-             CameraController& camera, AudioBridge& audio, const String& hostname);
+             CameraController& camera, AudioBridge& audio, AssetUploadServer& assets,
+             const String& hostname);
   void begin();
   void loop();
 
@@ -63,6 +65,7 @@ class DeviceHttp {
   ExpressionCoordinator& expressions_;
   CameraController& camera_;
   AudioBridge& audio_;
+  AssetUploadServer& assets_;
   String hostname_;
   WebServer server_;
   File uploadFile_;

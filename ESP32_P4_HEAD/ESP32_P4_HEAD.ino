@@ -15,6 +15,7 @@
 #include <WiFi.h>
 
 #include "audio_bridge.h"
+#include "asset_upload_server.h"
 #include "board_config.h"
 #include "camera_controller.h"
 #include "device_http.h"
@@ -30,6 +31,7 @@ ServoExecutor gServos;
 PairingStore gPairing;
 CameraController gCamera;
 AudioBridge gAudio(gPairing);
+AssetUploadServer gAssets(gPairing);
 PixelStrip gPixels;
 DisplayController gDisplay;
 ExpressionCoordinator gExpressions(gDisplay, gPixels);
@@ -124,8 +126,9 @@ void setup() {
     Serial.println("[FATAL] ESP32-C6 hosted Wi-Fi failed");
   }
   Serial.printf("[AUDIO] bridge ready=%d\n", gAudio.begin());
+  Serial.printf("[ASSET] server ready=%d\n", gAssets.begin());
   startMdns();
-  gHttp = new DeviceHttp(gPairing, gServos, gExpressions, gCamera, gAudio, gHostname);
+  gHttp = new DeviceHttp(gPairing, gServos, gExpressions, gCamera, gAudio, gAssets, gHostname);
   gHttp->begin();
   gMotion.begin();
   // Stay visually dark until the paired backend requests an expression. This
