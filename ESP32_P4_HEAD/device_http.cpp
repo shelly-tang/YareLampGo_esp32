@@ -18,6 +18,7 @@ constexpr char kOwnerHeader[] = "X-Lampgo-Owner";
 constexpr char kTokenHeader[] = "X-Lampgo-Token";
 constexpr char kClipIdHeader[] = "X-Lampgo-Clip-Id";
 constexpr char kEffectIdHeader[] = "X-Lampgo-Effect-Id";
+constexpr char kUploadPhaseHeader[] = "X-Lampgo-Upload-Phase";
 
 uint32_t parseColor(String value) {
   value.trim();
@@ -39,8 +40,8 @@ void DeviceHttp::begin() {
   // Raw body callbacks run before WebServer parses query arguments.  Retain
   // the headers that identify the paired owner and target asset.
   const char* headers[] = {kContentTypeHeader, kOwnerHeader, kTokenHeader,
-                           kClipIdHeader, kEffectIdHeader};
-  server_.collectHeaders(headers, 5);
+                           kClipIdHeader, kEffectIdHeader, kUploadPhaseHeader};
+  server_.collectHeaders(headers, 6);
   registerRoutes();
   server_.begin();
   Serial.printf("[HTTP READY] http://%s/\n", hostname_.c_str());
@@ -83,7 +84,7 @@ void DeviceHttp::registerRoutes() {
              [this]() { handleAssetDelete(UploadKind::kEye); });
   server_.on(
       "/device/expression-clips/upload", HTTP_POST,
-      [this]() { finishUpload(UploadKind::kEye); },
+      [this]() { finishUploadRequest(UploadKind::kEye); },
       [this]() { handleUploadData(UploadKind::kEye); });
   server_.on("/device/led-effects", HTTP_GET,
              [this]() { handleAssetList(UploadKind::kLed); });
@@ -91,7 +92,7 @@ void DeviceHttp::registerRoutes() {
              [this]() { handleAssetDelete(UploadKind::kLed); });
   server_.on(
       "/device/led-effects/upload", HTTP_POST,
-      [this]() { finishUpload(UploadKind::kLed); },
+      [this]() { finishUploadRequest(UploadKind::kLed); },
       [this]() { handleUploadData(UploadKind::kLed); });
   server_.on("/device/clock", HTTP_POST, [this]() { handleClock(); });
   server_.on("/api/wifi", HTTP_POST, [this]() { handleConnect(); });
@@ -214,7 +215,7 @@ void DeviceHttp::handleStatus() {
   response["firmware"] = BoardConfig::kFirmwareVersion;
   response["platform"] = "esp32-p4";
   response["motion_port"] = BoardConfig::kMotionWsPort;
-  response["asset_upload_port"] = assets_.ready() ? BoardConfig::kAssetUploadPort : 0;
+  response["asset_upload_port"] = BoardConfig::kAssetUploadPort;
   response["ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : WiFi.softAPIP().toString();
   response["network_mode"] = WiFi.status() == WL_CONNECTED ? "sta" : "softap";
   response["rssi"] = WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0;
@@ -259,7 +260,7 @@ void DeviceHttp::handleStatus() {
   response["lcd_ready"] = expressions_.displayReady();
   JsonObject capabilities = response["capabilities"].to<JsonObject>();
   capabilities["motion_ws"] = true;
-  capabilities["asset_upload_port"] = assets_.ready() ? BoardConfig::kAssetUploadPort : 0;
+  capabilities["asset_upload_port"] = BoardConfig::kAssetUploadPort;
   capabilities["servo_count"] = BoardConfig::kServoCount;
   capabilities["led_pixels"] = BoardConfig::kLedCount;
   capabilities["lcd_width"] = BoardConfig::kLcdWidth;
@@ -526,6 +527,50 @@ void DeviceHttp::handleAssetDelete(UploadKind kind) {
 }
 
 void DeviceHttp::handleUploadData(UploadKind kind) {
+  const String phase = server_.header(kUploadPhaseHeader);
+  if (!phase.isEmpty()) {
+    HTTPRaw& raw = server_.raw();
+    const String id = kind == UploadKind::kEye ? server_.header(kClipIdHeader) :
+                                                 server_.header(kEffectIdHeader);
+    if (phase == "start") {
+      if (raw.status == RAW_START) {
+        startUpload(kind, id);
+      } else if (raw.status == RAW_WRITE && raw.currentSize != 0) {
+        uploadOk_ = false;
+        uploadError_ = "start body must be empty";
+      } else if (raw.status == RAW_ABORTED) {
+        endUpload(kind, true);
+      }
+    } else if (phase == "chunk") {
+      if (raw.status == RAW_START) {
+        if (!authorizeRequest() || !uploadOk_ || kind != uploadKind_ || id != uploadId_ || !uploadFile_) {
+          uploadOk_ = false;
+          uploadError_ = "no matching asset upload";
+        }
+      } else if (raw.status == RAW_WRITE) {
+        appendUpload(kind, raw.buf, raw.currentSize);
+      } else if (raw.status == RAW_ABORTED) {
+        endUpload(kind, true);
+      }
+    } else if (phase == "finish") {
+      if (raw.status == RAW_START) {
+        if (!authorizeRequest() || !uploadOk_ || kind != uploadKind_ || id != uploadId_ || !uploadFile_) {
+          uploadOk_ = false;
+          uploadError_ = "no matching asset upload";
+        }
+      } else if (raw.status == RAW_WRITE && raw.currentSize != 0) {
+        uploadOk_ = false;
+        uploadError_ = "finish body must be empty";
+      } else if (raw.status == RAW_ABORTED) {
+        endUpload(kind, true);
+      }
+    } else {
+      uploadOk_ = false;
+      uploadError_ = "invalid upload phase";
+    }
+    return;
+  }
+
   if (!server_.header(kContentTypeHeader).startsWith("multipart/")) {
     HTTPRaw& raw = server_.raw();
     if (raw.status == RAW_START) {
@@ -550,7 +595,61 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
   }
 }
 
+void DeviceHttp::finishUploadRequest(UploadKind kind) {
+  const String phase = server_.header(kUploadPhaseHeader);
+  if (phase.isEmpty()) {
+    finishUpload(kind);
+    return;
+  }
+
+  const HTTPRaw& raw = server_.raw();
+  if (phase == "start") {
+    if (raw.totalSize != 0) {
+      uploadOk_ = false;
+      uploadError_ = "start body must be empty";
+    }
+    if (!uploadOk_) {
+      if (uploadFile_) uploadFile_.close();
+      LittleFS.remove(uploadTempPath_);
+      sendError(400, uploadError_.isEmpty() ? "cannot start asset upload" : uploadError_.c_str());
+      return;
+    }
+    sendUploadProgress("started");
+    return;
+  }
+  if (phase == "chunk") {
+    if (raw.totalSize == 0) {
+      uploadOk_ = false;
+      uploadError_ = "asset chunk must not be empty";
+    }
+    if (!uploadOk_) {
+      if (uploadFile_) uploadFile_.close();
+      LittleFS.remove(uploadTempPath_);
+      sendError(400, uploadError_.isEmpty() ? "asset chunk rejected" : uploadError_.c_str());
+      return;
+    }
+    sendUploadProgress("chunk");
+    return;
+  }
+  if (phase == "finish") {
+    if (raw.totalSize != 0) {
+      uploadOk_ = false;
+      uploadError_ = "finish body must be empty";
+    }
+    if (!uploadOk_) {
+      if (uploadFile_) uploadFile_.close();
+      LittleFS.remove(uploadTempPath_);
+      sendError(400, uploadError_.isEmpty() ? "asset upload failed" : uploadError_.c_str());
+      return;
+    }
+    finishUpload(kind);
+    return;
+  }
+  sendError(400, "invalid upload phase");
+}
+
 void DeviceHttp::startUpload(UploadKind kind, const String& assetId) {
+  if (uploadFile_) uploadFile_.close();
   uploadKind_ = kind;
   uploadId_ = assetId;
   uploadTempPath_ = kind == UploadKind::kEye ? "/upload_eye.tmp" : "/upload_led.tmp";
@@ -597,6 +696,7 @@ void DeviceHttp::finishUpload(UploadKind kind) {
     sendError(400, uploadError_.isEmpty() ? "upload failed" : uploadError_.c_str());
     return;
   }
+  if (uploadFile_) uploadFile_.close();
   String error;
   if (!validateStoredAsset(kind, uploadTempPath_, error)) {
     LittleFS.remove(uploadTempPath_);
@@ -616,6 +716,13 @@ void DeviceHttp::finishUpload(UploadKind kind) {
   response[kind == UploadKind::kEye ? "clip_id" : "effect_id"] = uploadId_;
   response["bytes"] = uploadBytes_;
   if (kind == UploadKind::kEye) response["display_confirmed"] = true;
+  sendJson(200, response);
+}
+
+void DeviceHttp::sendUploadProgress(const char* action) {
+  JsonDocument response;
+  response["ok"] = true;
+  response["action"] = action;
   sendJson(200, response);
 }
 

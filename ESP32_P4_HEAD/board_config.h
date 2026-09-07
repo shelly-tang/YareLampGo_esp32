@@ -64,7 +64,10 @@ constexpr uint32_t kAudioSampleRate = 16000;
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kAudioWsPort = 81;
 constexpr uint16_t kMotionWsPort = 82;
-constexpr uint16_t kAssetUploadPort = kAudioWsPort;
+// Asset chunks share the control server.  The audio WebSocket server must not
+// receive HTTP request bodies: doing so can stall its event loop and take the
+// rest of the Wi-Fi stack with it.
+constexpr uint16_t kAssetUploadPort = kHttpPort;
 constexpr char kSetupSsidPrefix[] = "Lampgo-P4-Setup-";
 constexpr char kSetupPassword[] = "lampgo-p4-setup";
 

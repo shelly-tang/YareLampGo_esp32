@@ -43,10 +43,12 @@ class DeviceHttp {
   void handleAssetList(UploadKind kind);
   void handleAssetDelete(UploadKind kind);
   void handleUploadData(UploadKind kind);
+  void finishUploadRequest(UploadKind kind);
   void startUpload(UploadKind kind, const String& assetId);
   void appendUpload(UploadKind kind, const uint8_t* data, size_t size);
   void endUpload(UploadKind kind, bool aborted);
   void finishUpload(UploadKind kind);
+  void sendUploadProgress(const char* action);
   void handleForgetWifi();
   void handleReboot();
   void handleServoStatus();
