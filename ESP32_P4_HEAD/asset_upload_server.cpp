@@ -50,23 +50,10 @@ bool hasExpectedMagic(const String& path, bool eyeAsset) {
 }
 }  // namespace
 
-bool AssetUploadServer::begin() {
+bool AssetUploadServer::begin(httpd_handle_t server) {
+  if (!server) return false;
   uploadMutex_ = xSemaphoreCreateMutex();
   if (!uploadMutex_) return false;
-
-  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-  config.server_port = BoardConfig::kAssetUploadPort;
-  config.ctrl_port = 32771;
-  config.stack_size = 8192;
-  config.max_open_sockets = 2;
-  config.max_uri_handlers = 2;
-  config.recv_wait_timeout = 15;
-  config.send_wait_timeout = 15;
-  if (httpd_start(&server_, &config) != ESP_OK) {
-    vSemaphoreDelete(uploadMutex_);
-    uploadMutex_ = nullptr;
-    return false;
-  }
 
   httpd_uri_t eyeRoute{};
   eyeRoute.uri = "/device/expression-clips/upload";
@@ -78,15 +65,14 @@ bool AssetUploadServer::begin() {
   ledRoute.method = HTTP_POST;
   ledRoute.handler = handleLedUpload;
   ledRoute.user_ctx = this;
-  if (httpd_register_uri_handler(server_, &eyeRoute) != ESP_OK ||
-      httpd_register_uri_handler(server_, &ledRoute) != ESP_OK) {
-    httpd_stop(server_);
-    server_ = nullptr;
+  if (httpd_register_uri_handler(server, &eyeRoute) != ESP_OK ||
+      httpd_register_uri_handler(server, &ledRoute) != ESP_OK) {
     vSemaphoreDelete(uploadMutex_);
     uploadMutex_ = nullptr;
     return false;
   }
-  Serial.printf("[ASSET] HTTP streaming server ready port=%u\n", BoardConfig::kAssetUploadPort);
+  ready_ = true;
+  Serial.printf("[ASSET] HTTP streaming routes ready port=%u\n", BoardConfig::kAssetUploadPort);
   return true;
 }
 

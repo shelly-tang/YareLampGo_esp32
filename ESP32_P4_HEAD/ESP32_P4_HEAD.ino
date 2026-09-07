@@ -126,7 +126,7 @@ void setup() {
     Serial.println("[FATAL] ESP32-C6 hosted Wi-Fi failed");
   }
   Serial.printf("[AUDIO] bridge ready=%d\n", gAudio.begin());
-  Serial.printf("[ASSET] server ready=%d\n", gAssets.begin());
+  Serial.printf("[ASSET] server ready=%d\n", gAssets.begin(gAudio.httpServer()));
   startMdns();
   gHttp = new DeviceHttp(gPairing, gServos, gExpressions, gCamera, gAudio, gAssets, gHostname);
   gHttp->begin();

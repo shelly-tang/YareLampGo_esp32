@@ -4,6 +4,7 @@
 #pragma once
 
 #include <Arduino.h>
+#include <esp_http_server.h>
 
 #include "pairing_store.h"
 
@@ -18,6 +19,7 @@ class AudioBridge {
   bool speakerReady() const;
   bool aecReady() const;
   bool aecEnabled() const;
+  httpd_handle_t httpServer() const;
   const char* profile() const;
   bool setProfile(const String& profile);
   float speakerVolume() const;

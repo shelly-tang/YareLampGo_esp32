@@ -12,8 +12,8 @@ class AssetUploadServer {
  public:
   explicit AssetUploadServer(PairingStore& pairing) : pairing_(pairing) {}
 
-  bool begin();
-  bool ready() const { return server_ != nullptr; }
+  bool begin(httpd_handle_t server);
+  bool ready() const { return ready_; }
 
  private:
   static esp_err_t handleEyeUpload(httpd_req_t* request);
@@ -21,6 +21,6 @@ class AssetUploadServer {
   esp_err_t handleUpload(httpd_req_t* request, bool eyeAsset);
 
   PairingStore& pairing_;
-  httpd_handle_t server_ = nullptr;
+  bool ready_ = false;
   SemaphoreHandle_t uploadMutex_ = nullptr;
 };

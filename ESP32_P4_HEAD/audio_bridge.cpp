@@ -467,7 +467,7 @@ bool AudioBridge::begin() {
   config.server_port = BoardConfig::kAudioWsPort;
   config.ctrl_port = 32769;
   config.stack_size = 8192;
-  config.max_uri_handlers = 3;
+  config.max_uri_handlers = 5;
   const bool serverReady = httpd_start(&gServer, &config) == ESP_OK &&
                            registerWs("/ws/audio", audioHandler) &&
                            registerWs("/ws/events", eventHandler) &&
@@ -485,6 +485,7 @@ void AudioBridge::setMicrophoneEnabled(bool enabled) { gMicEnabled = enabled; }
 bool AudioBridge::speakerReady() const { return gSpeakerReady; }
 bool AudioBridge::aecReady() const { return gAecReady; }
 bool AudioBridge::aecEnabled() const { return gAecReady && gAecEnabled; }
+httpd_handle_t AudioBridge::httpServer() const { return gServer; }
 const char* AudioBridge::profile() const { return gProfile; }
 
 bool AudioBridge::setProfile(const String& profile) {
