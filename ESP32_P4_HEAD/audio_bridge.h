@@ -27,6 +27,13 @@ class AudioBridge {
   uint32_t micFrames() const;
   uint32_t speakerPackets() const;
   uint32_t speakerDrops() const;
+  uint8_t audioClientCount() const;
+  uint32_t audioConnections() const;
+  uint32_t audioFramesQueued() const;
+  uint32_t audioFramesSent() const;
+  uint32_t audioSendFailures() const;
+  uint32_t audioQueueFailures() const;
+  uint32_t audioAuthFailures() const;
 
  private:
   PairingStore& pairing_;

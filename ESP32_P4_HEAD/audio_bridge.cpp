@@ -65,12 +65,18 @@ volatile bool gMicReady = false;
 volatile bool gMicEnabled = true;
 volatile bool gSpeakerReady = false;
 volatile bool gAecReady = false;
-volatile bool gAecEnabled = true;
+volatile bool gAecEnabled = false;
 volatile uint32_t gMicFrames = 0;
 volatile uint32_t gSpeakerPackets = 0;
 volatile uint32_t gSpeakerDrops = 0;
+volatile uint32_t gAudioConnections = 0;
+volatile uint32_t gAudioFramesQueued = 0;
+volatile uint32_t gAudioFramesSent = 0;
+volatile uint32_t gAudioSendFailures = 0;
+volatile uint32_t gAudioQueueFailures = 0;
+volatile uint32_t gAudioAuthFailures = 0;
 volatile float gSpeakerVolume = 0.25f;
-char gProfile[24] = "aec_experiment";
+char gProfile[24] = "microphone_only";
 
 const esp_afe_sr_iface_t* gAfe = nullptr;
 esp_afe_sr_data_t* gAfeData = nullptr;
@@ -109,15 +115,34 @@ bool addAudioClient(int fd, uint32_t pairingRevision) {
   bool added = false;
   xSemaphoreTake(gClientMutex, portMAX_DELAY);
   for (AudioClient& client : gAudioClients) {
+    if (client.fd == fd) {
+      client.pairingRevision = pairingRevision;
+      added = true;
+      break;
+    }
     if (client.fd < 0) {
       client.fd = fd;
       client.pairingRevision = pairingRevision;
       added = true;
+      gAudioConnections = gAudioConnections + 1;
       break;
     }
   }
   xSemaphoreGive(gClientMutex);
   return added;
+}
+
+bool isAudioClient(int fd) {
+  bool present = false;
+  xSemaphoreTake(gClientMutex, portMAX_DELAY);
+  for (const AudioClient& client : gAudioClients) {
+    if (client.fd == fd) {
+      present = true;
+      break;
+    }
+  }
+  xSemaphoreGive(gClientMutex);
+  return present;
 }
 
 bool hasAudioClient() {
@@ -136,6 +161,11 @@ bool hasAudioClient() {
 
 void sendComplete(esp_err_t result, int fd, void* argument) {
   PendingFrame* pending = static_cast<PendingFrame*>(argument);
+  if (result == ESP_OK) {
+    gAudioFramesSent = gAudioFramesSent + 1;
+  } else {
+    gAudioSendFailures = gAudioSendFailures + 1;
+  }
   if (gClientMutex) {
     xSemaphoreTake(gClientMutex, portMAX_DELAY);
     for (AudioClient& client : gAudioClients) {
@@ -155,16 +185,12 @@ void sendComplete(esp_err_t result, int fd, void* argument) {
 
 void sendWork(void* argument) {
   PendingFrame* pending = static_cast<PendingFrame*>(argument);
-  if (!pending || !gServer ||
-      httpd_ws_get_fd_info(gServer, pending->fd) != HTTPD_WS_CLIENT_WEBSOCKET ||
-      httpd_ws_send_data_async(gServer, pending->fd, &pending->frame, sendComplete, pending) !=
-          ESP_OK) {
-    if (pending) {
-      removeAudioClient(pending->fd);
-      heap_caps_free(pending->payload);
-      free(pending);
-    }
-  }
+  if (!pending) return;
+  const esp_err_t result =
+      gServer && httpd_ws_get_fd_info(gServer, pending->fd) == HTTPD_WS_CLIENT_WEBSOCKET
+          ? httpd_ws_send_frame_async(gServer, pending->fd, &pending->frame)
+          : ESP_FAIL;
+  sendComplete(result, pending->fd, pending);
 }
 
 void queueAudioFrame(const uint8_t* data, size_t length) {
@@ -200,6 +226,7 @@ void queueAudioFrame(const uint8_t* data, size_t length) {
     }
     if (!pending || !pending->payload) {
       if (pending) free(pending);
+      gAudioQueueFailures = gAudioQueueFailures + 1;
       removeAudioClient(targets[index]);
       continue;
     }
@@ -209,9 +236,12 @@ void queueAudioFrame(const uint8_t* data, size_t length) {
     pending->frame.payload = pending->payload;
     pending->frame.len = length;
     if (httpd_queue_work(gServer, sendWork, pending) != ESP_OK) {
+      gAudioQueueFailures = gAudioQueueFailures + 1;
       removeAudioClient(pending->fd);
       heap_caps_free(pending->payload);
       free(pending);
+    } else {
+      gAudioFramesQueued = gAudioFramesQueued + 1;
     }
   }
 }
@@ -379,12 +409,41 @@ void enqueueSpeaker(const uint8_t* data, size_t length) {
 esp_err_t audioHandler(httpd_req_t* request) {
   const int fd = httpd_req_to_sockfd(request);
   if (request->method == HTTP_GET) {
-    if (!authorize(request) || !addAudioClient(fd, gPairing->revision())) return ESP_FAIL;
-    return ESP_OK;
+    if (authorize(request) && addAudioClient(fd, gPairing->revision())) return ESP_OK;
+    gAudioAuthFailures = gAudioAuthFailures + 1;
+    return ESP_FAIL;
   }
   httpd_ws_frame_t frame{};
   if (httpd_ws_recv_frame(request, &frame, 0) != ESP_OK) return ESP_FAIL;
-  if (frame.type == HTTPD_WS_TYPE_CLOSE) removeAudioClient(fd);
+  if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+    removeAudioClient(fd);
+    return ESP_OK;
+  }
+  if (frame.len == 0 || frame.len >= 288) {
+    gAudioAuthFailures = gAudioAuthFailures + 1;
+    return ESP_FAIL;
+  }
+  char credentials[288]{};
+  frame.payload = reinterpret_cast<uint8_t*>(credentials);
+  if (httpd_ws_recv_frame(request, &frame, frame.len) != ESP_OK) return ESP_FAIL;
+  if (isAudioClient(fd)) return ESP_OK;
+  if (frame.type != HTTPD_WS_TYPE_TEXT) {
+    gAudioAuthFailures = gAudioAuthFailures + 1;
+    return ESP_FAIL;
+  }
+  const char* tokenPrefix = "&token=";
+  char* token = strstr(credentials, tokenPrefix);
+  if (strncmp(credentials, "owner=", 6) != 0 || !token) {
+    gAudioAuthFailures = gAudioAuthFailures + 1;
+    return ESP_FAIL;
+  }
+  *token = 0;
+  token += strlen(tokenPrefix);
+  if (!gPairing || !gPairing->authorize(credentials + 6, token) ||
+      !addAudioClient(fd, gPairing->revision())) {
+    gAudioAuthFailures = gAudioAuthFailures + 1;
+    return ESP_FAIL;
+  }
   return ESP_OK;
 }
 
@@ -441,42 +500,47 @@ bool registerWs(const char* path, esp_err_t (*handler)(httpd_req_t*)) {
 bool AudioBridge::begin() {
   gPairing = &pairing_;
   gClientMutex = xSemaphoreCreateMutex();
-  gReferenceMutex = xSemaphoreCreateMutex();
-  gSpeakerQueue = xQueueCreate(kSpeakerQueueDepth, sizeof(AudioPacket));
-  gReference = static_cast<int16_t*>(
-      heap_caps_calloc(kReferenceSamples, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (!gClientMutex || !gReferenceMutex || !gSpeakerQueue || !gReference) return false;
-
-  pinMode(BoardConfig::kSpeakerBclk, OUTPUT);
-  pinMode(BoardConfig::kSpeakerLrclk, OUTPUT);
-  pinMode(BoardConfig::kSpeakerData, OUTPUT);
-  digitalWrite(BoardConfig::kSpeakerBclk, LOW);
-  digitalWrite(BoardConfig::kSpeakerLrclk, LOW);
-  digitalWrite(BoardConfig::kSpeakerData, LOW);
-  gSpeaker.setPins(BoardConfig::kSpeakerBclk, BoardConfig::kSpeakerLrclk,
-                   BoardConfig::kSpeakerData);
-  gSpeakerReady = gSpeaker.begin(I2S_MODE_STD, kSpeakerOutputRate, I2S_DATA_BIT_WIDTH_16BIT,
-                                 I2S_SLOT_MODE_MONO);
+  if (!gClientMutex) return false;
 
   gMic.setPinsPdmRx(BoardConfig::kMicClock, BoardConfig::kMicData);
   gMicReady = gMic.begin(I2S_MODE_PDM_RX, BoardConfig::kAudioSampleRate,
                          I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO);
-  gAecReady = gMicReady && gSpeakerReady && beginAec();
+
+  if (BoardConfig::kEnableAudioSpeaker) {
+    gReferenceMutex = xSemaphoreCreateMutex();
+    gSpeakerQueue = xQueueCreate(kSpeakerQueueDepth, sizeof(AudioPacket));
+    gReference = static_cast<int16_t*>(heap_caps_calloc(
+        kReferenceSamples, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (!gReferenceMutex || !gSpeakerQueue || !gReference) return false;
+
+    pinMode(BoardConfig::kSpeakerBclk, OUTPUT);
+    pinMode(BoardConfig::kSpeakerLrclk, OUTPUT);
+    pinMode(BoardConfig::kSpeakerData, OUTPUT);
+    digitalWrite(BoardConfig::kSpeakerBclk, LOW);
+    digitalWrite(BoardConfig::kSpeakerLrclk, LOW);
+    digitalWrite(BoardConfig::kSpeakerData, LOW);
+    gSpeaker.setPins(BoardConfig::kSpeakerBclk, BoardConfig::kSpeakerLrclk,
+                     BoardConfig::kSpeakerData);
+    gSpeakerReady = gSpeaker.begin(I2S_MODE_STD, kSpeakerOutputRate, I2S_DATA_BIT_WIDTH_16BIT,
+                                   I2S_SLOT_MODE_MONO);
+  }
+  gAecReady = BoardConfig::kEnableAudioAec && gMicReady && gSpeakerReady && beginAec();
+  gAecEnabled = gAecReady;
 
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = BoardConfig::kAudioWsPort;
   config.ctrl_port = 32769;
   config.stack_size = 8192;
   config.max_uri_handlers = 5;
-  const bool serverReady = httpd_start(&gServer, &config) == ESP_OK &&
-                           registerWs("/ws/audio", audioHandler) &&
-                           registerWs("/ws/events", eventHandler) &&
-                           registerWs("/ws/speaker", speakerHandler);
+  bool serverReady = httpd_start(&gServer, &config) == ESP_OK &&
+                     registerWs("/ws/audio", audioHandler) &&
+                     registerWs("/ws/events", eventHandler);
+  if (serverReady && gSpeakerReady) serverReady = registerWs("/ws/speaker", speakerHandler);
   if (gMicReady) xTaskCreate(micTask, "audio-mic", 6144, nullptr, 4, &gMicTask);
   if (gSpeakerReady) xTaskCreate(speakerTask, "audio-speaker", 6144, nullptr, 4, &gSpeakerTask);
   Serial.printf("[AUDIO] mic=%d speaker=%d aec=%d ws=%d port=%u\n", gMicReady,
                 gSpeakerReady, gAecReady, serverReady, BoardConfig::kAudioWsPort);
-  return serverReady && gMicReady && gSpeakerReady;
+  return serverReady && gMicReady;
 }
 
 bool AudioBridge::microphoneReady() const { return gMicReady; }
@@ -490,8 +554,10 @@ const char* AudioBridge::profile() const { return gProfile; }
 
 bool AudioBridge::setProfile(const String& profile) {
   if (profile == "aec_experiment") {
+    if (!gAecReady) return false;
     gAecEnabled = true;
-  } else if (profile == "stable_raw" || profile == "interruptible_raw") {
+  } else if (profile == "stable_raw" || profile == "interruptible_raw" ||
+             profile == "microphone_only") {
     gAecEnabled = false;
   } else {
     return false;
@@ -509,3 +575,21 @@ void AudioBridge::setSpeakerVolume(float volume) {
 uint32_t AudioBridge::micFrames() const { return gMicFrames; }
 uint32_t AudioBridge::speakerPackets() const { return gSpeakerPackets; }
 uint32_t AudioBridge::speakerDrops() const { return gSpeakerDrops; }
+
+uint8_t AudioBridge::audioClientCount() const {
+  if (!gClientMutex) return 0;
+  uint8_t count = 0;
+  xSemaphoreTake(gClientMutex, portMAX_DELAY);
+  for (const AudioClient& client : gAudioClients) {
+    if (client.fd >= 0) ++count;
+  }
+  xSemaphoreGive(gClientMutex);
+  return count;
+}
+
+uint32_t AudioBridge::audioConnections() const { return gAudioConnections; }
+uint32_t AudioBridge::audioFramesQueued() const { return gAudioFramesQueued; }
+uint32_t AudioBridge::audioFramesSent() const { return gAudioFramesSent; }
+uint32_t AudioBridge::audioSendFailures() const { return gAudioSendFailures; }
+uint32_t AudioBridge::audioQueueFailures() const { return gAudioQueueFailures; }
+uint32_t AudioBridge::audioAuthFailures() const { return gAudioAuthFailures; }

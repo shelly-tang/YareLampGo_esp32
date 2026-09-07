@@ -281,6 +281,13 @@ void DeviceHttp::handleStatus() {
   audio["mic_frames"] = audio_.micFrames();
   audio["speaker_packets"] = audio_.speakerPackets();
   audio["speaker_drops"] = audio_.speakerDrops();
+  audio["ws_clients"] = audio_.audioClientCount();
+  audio["ws_connections"] = audio_.audioConnections();
+  audio["ws_frames_queued"] = audio_.audioFramesQueued();
+  audio["ws_frames_sent"] = audio_.audioFramesSent();
+  audio["ws_send_failures"] = audio_.audioSendFailures();
+  audio["ws_queue_failures"] = audio_.audioQueueFailures();
+  audio["ws_auth_failures"] = audio_.audioAuthFailures();
   response["led_ready"] = expressions_.ledReady();
   response["led_mode"] = expressions_.currentMode();
   response["led_brightness"] = expressions_.currentBrightness();

@@ -61,10 +61,13 @@ constexpr int kSpeakerLrclk = 34;
 constexpr int kSpeakerData = 49;
 constexpr uint32_t kAudioSampleRate = 16000;
 // ESP-Hosted and the P4 I2S/AEC stack both require internal DMA-capable RAM.
-// Keep this off while validating the Wi-Fi transport in isolation.  The
-// production profile will re-enable audio after the hosted buffer budget has
-// been sized and verified on the target board.
-constexpr bool kEnableAudioBridge = false;
+// Bring the microphone back in its own smallest useful configuration first:
+// PDM RX + /ws/audio.  Keep the speaker and ESP-SR AEC out of this diagnostic
+// image so a failed input test is attributable to the microphone path rather
+// than full-duplex buffering or echo processing.
+constexpr bool kEnableAudioBridge = true;
+constexpr bool kEnableAudioSpeaker = false;
+constexpr bool kEnableAudioAec = false;
 
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kAudioWsPort = 81;
