@@ -60,6 +60,11 @@ constexpr int kSpeakerBclk = 33;
 constexpr int kSpeakerLrclk = 34;
 constexpr int kSpeakerData = 49;
 constexpr uint32_t kAudioSampleRate = 16000;
+// ESP-Hosted and the P4 I2S/AEC stack both require internal DMA-capable RAM.
+// Keep this off while validating the Wi-Fi transport in isolation.  The
+// production profile will re-enable audio after the hosted buffer budget has
+// been sized and verified on the target board.
+constexpr bool kEnableAudioBridge = false;
 
 constexpr uint16_t kHttpPort = 80;
 constexpr uint16_t kAudioWsPort = 81;

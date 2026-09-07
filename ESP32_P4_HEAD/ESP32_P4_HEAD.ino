@@ -125,7 +125,9 @@ void setup() {
   if (!connectNetwork()) {
     Serial.println("[FATAL] ESP32-C6 hosted Wi-Fi failed");
   }
-  Serial.printf("[AUDIO] bridge ready=%d\n", gAudio.begin());
+  const bool audioReady = BoardConfig::kEnableAudioBridge && gAudio.begin();
+  Serial.printf("[AUDIO] bridge enabled=%d ready=%d\n", BoardConfig::kEnableAudioBridge,
+                audioReady);
   // Bounded asset chunks are handled by DeviceHttp on port 80.  Keeping the
   // audio WebSocket server free of HTTP bodies preserves Wi-Fi responsiveness.
   startMdns();
