@@ -11,12 +11,13 @@
 namespace {
 constexpr size_t kMaxEyeBytes = 512 * 1024;
 constexpr size_t kMaxLedBytes = 8 * 1024;
-constexpr size_t kReceiveBufferBytes = 1024;
+constexpr size_t kMaxChunkBytes = 1024;
 constexpr size_t kMaxHeaderValueBytes = 128;
 constexpr char kOwnerHeader[] = "X-Lampgo-Owner";
 constexpr char kTokenHeader[] = "X-Lampgo-Token";
 constexpr char kClipIdHeader[] = "X-Lampgo-Clip-Id";
 constexpr char kEffectIdHeader[] = "X-Lampgo-Effect-Id";
+constexpr char kUploadPhaseHeader[] = "X-Lampgo-Upload-Phase";
 
 bool readHeader(httpd_req_t* request, const char* name, String& value) {
   const size_t length = httpd_req_get_hdr_value_len(request, name);
@@ -72,7 +73,8 @@ bool AssetUploadServer::begin(httpd_handle_t server) {
     return false;
   }
   ready_ = true;
-  Serial.printf("[ASSET] HTTP streaming routes ready port=%u\n", BoardConfig::kAssetUploadPort);
+  Serial.printf("[ASSET] HTTP chunk upload routes ready port=%u chunk=%u\n",
+                BoardConfig::kAssetUploadPort, static_cast<unsigned int>(kMaxChunkBytes));
   return true;
 }
 
@@ -88,67 +90,117 @@ esp_err_t AssetUploadServer::handleUpload(httpd_req_t* request, bool eyeAsset) {
   String owner;
   String token;
   String assetId;
+  String phase;
+  const UploadKind kind = eyeAsset ? UploadKind::kEye : UploadKind::kLed;
   const char* idHeader = eyeAsset ? kClipIdHeader : kEffectIdHeader;
   if (!readHeader(request, kOwnerHeader, owner) || !readHeader(request, kTokenHeader, token) ||
-      !readHeader(request, idHeader, assetId) || !pairing_.authorize(owner, token)) {
+      !readHeader(request, idHeader, assetId) || !readHeader(request, kUploadPhaseHeader, phase) ||
+      !pairing_.authorize(owner, token)) {
     return sendError(request, "403 Forbidden", "pairing mismatch");
   }
   if (!ExpressionCoordinator::safeAssetId(assetId)) {
     return sendError(request, "400 Bad Request", "invalid asset id");
   }
-  const size_t limit = eyeAsset ? kMaxEyeBytes : kMaxLedBytes;
-  if (request->content_len <= 0 || static_cast<size_t>(request->content_len) > limit) {
-    return sendError(request, "413 Payload Too Large", "asset exceeds limit");
-  }
   if (!uploadMutex_ || xSemaphoreTake(uploadMutex_, pdMS_TO_TICKS(3000)) != pdTRUE) {
     return sendError(request, "409 Conflict", "another asset upload is active");
   }
 
-  const String tempPath = eyeAsset ? "/upload_eye.tmp" : "/upload_led.tmp";
-  const String destination = eyeAsset ? ExpressionCoordinator::eyePath(assetId) :
-                                       ExpressionCoordinator::ledPath(assetId);
-  LittleFS.remove(tempPath);
-  File file = LittleFS.open(tempPath, "w");
-  if (!file) {
-    xSemaphoreGive(uploadMutex_);
-    return sendError(request, "500 Internal Server Error", "cannot open upload file");
-  }
-
-  uint8_t buffer[kReceiveBufferBytes]{};
-  size_t receivedTotal = 0;
-  while (receivedTotal < static_cast<size_t>(request->content_len)) {
-    const size_t remaining = static_cast<size_t>(request->content_len) - receivedTotal;
-    const size_t requested = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
-    const int received = httpd_req_recv(request, reinterpret_cast<char*>(buffer), requested);
-    if (received <= 0 || file.write(buffer, static_cast<size_t>(received)) != static_cast<size_t>(received)) {
-      file.close();
-      LittleFS.remove(tempPath);
-      xSemaphoreGive(uploadMutex_);
-      return sendError(request, "400 Bad Request", "asset stream interrupted");
+  esp_err_t result = ESP_OK;
+  if (phase == "start") {
+    if (request->content_len != 0 || !beginUpload(kind, assetId)) {
+      result = sendError(request, "400 Bad Request", "cannot start asset upload");
+    } else {
+      result = sendJson(request, "200 OK", "{\"ok\":true,\"action\":\"started\"}");
     }
-    receivedTotal += static_cast<size_t>(received);
-  }
-  file.close();
-
-  if (!hasExpectedMagic(tempPath, eyeAsset)) {
-    LittleFS.remove(tempPath);
-    xSemaphoreGive(uploadMutex_);
-    return sendError(request, "400 Bad Request", "invalid asset magic");
-  }
-  LittleFS.remove(destination);
-  if (!LittleFS.rename(tempPath, destination)) {
-    LittleFS.remove(tempPath);
-    xSemaphoreGive(uploadMutex_);
-    return sendError(request, "500 Internal Server Error", "cannot commit uploaded asset");
+  } else if (phase == "chunk") {
+    if (!appendChunk(kind, assetId, request)) {
+      clearUpload(true);
+      result = sendError(request, "400 Bad Request", "asset chunk rejected");
+    } else {
+      result = sendJson(request, "200 OK", "{\"ok\":true,\"action\":\"chunk\"}");
+    }
+  } else if (phase == "finish") {
+    if (request->content_len != 0) {
+      result = sendError(request, "400 Bad Request", "finish body must be empty");
+    } else {
+      result = finishUpload(request, kind, assetId);
+    }
+  } else {
+    result = sendError(request, "400 Bad Request", "invalid upload phase");
   }
   xSemaphoreGive(uploadMutex_);
+  return result;
+}
 
+bool AssetUploadServer::beginUpload(UploadKind kind, const String& assetId) {
+  clearUpload(true);
+  activeKind_ = kind;
+  activeId_ = assetId;
+  activeTempPath_ = kind == UploadKind::kEye ? "/upload_eye.tmp" : "/upload_led.tmp";
+  activeFile_ = LittleFS.open(activeTempPath_, "w");
+  if (!activeFile_) {
+    clearUpload(true);
+    return false;
+  }
+  activeBytes_ = 0;
+  return true;
+}
+
+bool AssetUploadServer::appendChunk(UploadKind kind, const String& assetId, httpd_req_t* request) {
+  const size_t limit = kind == UploadKind::kEye ? kMaxEyeBytes : kMaxLedBytes;
+  if (activeKind_ != kind || activeId_ != assetId || !activeFile_ || request->content_len <= 0 ||
+      static_cast<size_t>(request->content_len) > kMaxChunkBytes ||
+      activeBytes_ + static_cast<size_t>(request->content_len) > limit) {
+    return false;
+  }
+  uint8_t buffer[kMaxChunkBytes]{};
+  const int received = httpd_req_recv(request, reinterpret_cast<char*>(buffer), request->content_len);
+  if (received != request->content_len ||
+      activeFile_.write(buffer, static_cast<size_t>(received)) != static_cast<size_t>(received)) {
+    return false;
+  }
+  activeFile_.flush();
+  activeBytes_ += static_cast<size_t>(received);
+  return true;
+}
+
+esp_err_t AssetUploadServer::finishUpload(httpd_req_t* request, UploadKind kind,
+                                          const String& assetId) {
+  if (activeKind_ != kind || activeId_ != assetId || !activeFile_ || activeBytes_ == 0) {
+    return sendError(request, "400 Bad Request", "no matching asset upload");
+  }
+  const bool eyeAsset = kind == UploadKind::kEye;
+  const String completedId = activeId_;
+  const String tempPath = activeTempPath_;
+  activeFile_.close();
+  if (!hasExpectedMagic(tempPath, eyeAsset)) {
+    clearUpload(true);
+    return sendError(request, "400 Bad Request", "invalid asset magic");
+  }
+  const String destination = eyeAsset ? ExpressionCoordinator::eyePath(completedId) :
+                                       ExpressionCoordinator::ledPath(completedId);
+  LittleFS.remove(destination);
+  if (!LittleFS.rename(tempPath, destination)) {
+    clearUpload(true);
+    return sendError(request, "500 Internal Server Error", "cannot commit uploaded asset");
+  }
+  const size_t completedBytes = activeBytes_;
+  clearUpload(false);
   String response = String("{\"ok\":true,\"action\":\"upload\",\"") +
-                    (eyeAsset ? "clip_id" : "effect_id") + "\":\"" + assetId +
-                    "\",\"bytes\":" + String(receivedTotal);
+                    (eyeAsset ? "clip_id" : "effect_id") + "\":\"" + completedId +
+                    "\",\"bytes\":" + String(completedBytes);
   if (eyeAsset) response += ",\"display_confirmed\":true";
   response += "}";
   Serial.printf("[ASSET] upload kind=%s id=%s bytes=%u\n", eyeAsset ? "eye" : "led",
-                assetId.c_str(), static_cast<unsigned int>(receivedTotal));
+                completedId.c_str(), static_cast<unsigned int>(completedBytes));
   return sendJson(request, "200 OK", response);
+}
+
+void AssetUploadServer::clearUpload(bool removeTempFile) {
+  if (activeFile_) activeFile_.close();
+  if (removeTempFile && !activeTempPath_.isEmpty()) LittleFS.remove(activeTempPath_);
+  activeKind_ = UploadKind::kNone;
+  activeId_.clear();
+  activeTempPath_.clear();
+  activeBytes_ = 0;
 }
