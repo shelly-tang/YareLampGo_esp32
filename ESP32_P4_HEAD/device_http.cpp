@@ -13,6 +13,7 @@
 namespace {
 constexpr size_t kMaxEyeBytes = 512 * 1024;
 constexpr size_t kMaxLedBytes = 8 * 1024;
+constexpr char kContentTypeHeader[] = "Content-Type";
 
 uint32_t parseColor(String value) {
   value.trim();
@@ -31,6 +32,11 @@ DeviceHttp::DeviceHttp(PairingStore& pairing, ServoExecutor& servos,
       audio_(audio), hostname_(hostname), server_(BoardConfig::kHttpPort) {}
 
 void DeviceHttp::begin() {
+  // The upload callback is also invoked for raw request bodies in
+  // Arduino-ESP32 3.3.x.  Keep the content type so that a raw request is
+  // rejected safely instead of dereferencing the multipart upload object.
+  const char* headers[] = {kContentTypeHeader};
+  server_.collectHeaders(headers, 1);
   registerRoutes();
   server_.begin();
   Serial.printf("[HTTP READY] http://%s/\n", hostname_.c_str());
@@ -514,6 +520,21 @@ void DeviceHttp::handleAssetDelete(UploadKind kind) {
 }
 
 void DeviceHttp::handleUploadData(UploadKind kind) {
+  if (!server_.header(kContentTypeHeader).startsWith("multipart/")) {
+    // ``WebServer::on(..., uploadHandler)`` calls this handler for raw bodies
+    // too.  Those bodies have ``HTTPRaw`` state, not ``HTTPUpload`` state;
+    // accessing server_.upload() here crashes the HTTP task for larger clips.
+    if (server_.raw().status == RAW_START) {
+      uploadKind_ = kind;
+      uploadOk_ = false;
+      uploadError_ = "multipart asset upload required";
+      Serial.printf("[HTTP UPLOAD] rejected raw body kind=%s bytes=%u\n",
+                    kind == UploadKind::kEye ? "eye" : "led",
+                    static_cast<unsigned int>(server_.clientContentLength()));
+    }
+    return;
+  }
+
   HTTPUpload& upload = server_.upload();
   if (upload.status == UPLOAD_FILE_START) {
     uploadKind_ = kind;
@@ -522,11 +543,16 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
     uploadBytes_ = 0;
     uploadOk_ = authorizeRequest() && ExpressionCoordinator::safeAssetId(uploadId_);
     uploadError_ = uploadOk_ ? "" : "unauthorized or invalid asset id";
-    if (uploadOk_) uploadFile_ = LittleFS.open(uploadTempPath_, "w");
+    if (uploadOk_) {
+      LittleFS.remove(uploadTempPath_);
+      uploadFile_ = LittleFS.open(uploadTempPath_, "w");
+    }
     if (uploadOk_ && !uploadFile_) {
       uploadOk_ = false;
       uploadError_ = "cannot open upload file";
     }
+    Serial.printf("[HTTP UPLOAD] start kind=%s id=%s accepted=%d\n",
+                  kind == UploadKind::kEye ? "eye" : "led", uploadId_.c_str(), uploadOk_);
   } else if (upload.status == UPLOAD_FILE_WRITE && uploadOk_) {
     const size_t limit = kind == UploadKind::kEye ? kMaxEyeBytes : kMaxLedBytes;
     if (uploadBytes_ + upload.currentSize > limit ||
@@ -542,6 +568,9 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
       uploadOk_ = false;
       uploadError_ = "upload aborted";
     }
+    Serial.printf("[HTTP UPLOAD] end kind=%s bytes=%u ok=%d\n",
+                  kind == UploadKind::kEye ? "eye" : "led",
+                  static_cast<unsigned int>(uploadBytes_), uploadOk_);
   }
 }
 

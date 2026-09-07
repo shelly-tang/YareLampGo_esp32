@@ -16,22 +16,28 @@ bool CameraController::begin() {
   ESPVideoCamConfigClass sensor;
   ESPVideoDVPPinsConfigClass pins;
   ESPVideoDVPConfigClass config;
-  const bool configured =
-      sensor.begin(I2C_NUM_0, BoardConfig::kCameraScl, BoardConfig::kCameraSda, 100000,
-                   BoardConfig::kCameraReset, BoardConfig::kCameraPowerDown) &&
-      pins.begin(BoardConfig::kCameraVsync, BoardConfig::kCameraHref,
-                 BoardConfig::kCameraPclk, BoardConfig::kCameraXclk, BoardConfig::kCameraD0,
-                 BoardConfig::kCameraD1, BoardConfig::kCameraD2, BoardConfig::kCameraD3,
-                 BoardConfig::kCameraD4, BoardConfig::kCameraD5, BoardConfig::kCameraD6,
-                 BoardConfig::kCameraD7) &&
-      config.begin(sensor, pins, 20000000);
-  ready_ = configured && gVideo.begin(config) &&
-           gCapture.begin(ESP_VIDEO_DVP_DEVICE_NAME, 2) &&
-           gCapture.setFormat(ESP_VIDEO_FORMAT_JPEG) && setJpegQuality(jpegQuality_) &&
-           gCapture.startCapture();
-  Serial.printf("[CAMERA] OV5640 DVP ready=%d format=%s size=%lux%lu buffers=2\n", ready_,
-                gCapture.getFormatName(), static_cast<unsigned long>(gCapture.getWidth()),
-                static_cast<unsigned long>(gCapture.getHeight()));
+  const bool sensorReady = sensor.begin(
+      I2C_NUM_0, BoardConfig::kCameraScl, BoardConfig::kCameraSda, 100000,
+      BoardConfig::kCameraReset, BoardConfig::kCameraPowerDown);
+  const bool pinsReady = pins.begin(
+      BoardConfig::kCameraVsync, BoardConfig::kCameraHref, BoardConfig::kCameraPclk,
+      BoardConfig::kCameraXclk, BoardConfig::kCameraD0, BoardConfig::kCameraD1,
+      BoardConfig::kCameraD2, BoardConfig::kCameraD3, BoardConfig::kCameraD4,
+      BoardConfig::kCameraD5, BoardConfig::kCameraD6, BoardConfig::kCameraD7);
+  const bool configReady = sensorReady && pinsReady && config.begin(sensor, pins, 20000000);
+  const bool videoReady = configReady && gVideo.begin(config);
+  const bool captureReady = videoReady && gCapture.begin(ESP_VIDEO_DVP_DEVICE_NAME, 2);
+  const bool formatReady = captureReady && gCapture.setFormat(ESP_VIDEO_FORMAT_JPEG);
+  const bool qualityReady = formatReady && setJpegQuality(jpegQuality_);
+  const bool started = qualityReady && gCapture.startCapture();
+  ready_ = started;
+  Serial.printf(
+      "[CAMERA] OV5640 DVP ready=%d sensor=%d pins=%d config=%d video=%d capture=%d "
+      "format=%d quality=%d start=%d format_name=%s size=%lux%lu buffers=2\n",
+      ready_, sensorReady, pinsReady, configReady, videoReady, captureReady, formatReady,
+      qualityReady, started, gCapture.getFormatName(),
+      static_cast<unsigned long>(gCapture.getWidth()),
+      static_cast<unsigned long>(gCapture.getHeight()));
   return ready_;
 }
 
