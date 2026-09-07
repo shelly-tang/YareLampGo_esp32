@@ -1,12 +1,25 @@
 # LampGo ESP32 固件烧录指南
 
+## 先选硬件目标：旧 S3/C6 与新 P4 并存
+
+本仓库包含两套**并存**固件，P4 不是对旧 S3/C6 的覆盖升级。两套镜像、C6 的职责、分区表、接线和烧录命令不能混用。
+
+| 硬件路线 | 固件入口 | C6 的职责 | 应该烧录什么 |
+| --- | --- | --- | --- |
+| **旧版 S3 + 独立 C6 小屏** | 仓库根目录 + `ESP32_C6_LCD_1_47_UART/` | 小屏，通过 UART 接收 S3 转发的表情 | 本文根目录 `scripts/flash.sh` 对应的 S3，再单独烧录 C6 小屏固件。 |
+| **ESP32-P4 头部板 + C6 Wi-Fi** | [`ESP32_P4_HEAD/`](ESP32_P4_HEAD/) | P4 的 ESP-Hosted/SDIO 网络协处理器 | 仅烧录 P4 草图及其自定义分区；**不要**烧录 C6 小屏固件。 |
+
+旧用户继续使用根目录 `XIAO_ESP32S3` 与后端默认的 `motor_transport = "serial"`。P4 用户需要在后端显式设置 `motor_transport = "p4"`；构建、原生 USB、配网与安全步骤请看 [P4 头部板说明](ESP32_P4_HEAD/README.md)。
+
+下文只讲**旧 S3/C6** 的烧录路径。
+
 ## License
 
 本固件仓库默认基于 GPL-3.0-only 发布，除非具体文件另有说明。作者、版权和第三方归属见 [LICENSE](LICENSE)、[AUTHORS.md](AUTHORS.md)、[COPYRIGHT](COPYRIGHT) 和 [NOTICE](NOTICE)。
 
 部分摄像头服务和板级支持代码基于 Espressif ESP32 示例代码；相关文件中已有的 Apache-2.0 声明需要保留。发布预编译固件时，应同时提供对应源码、构建脚本、分区表和烧录说明。
 
-## 先复制这个：两个快捷烧录命令
+## 旧 S3/C6：两个快捷烧录命令
 
 如果你已经安装了 Arduino IDE，或者电脑里有 `arduino-cli`，在源码目录里运行：
 

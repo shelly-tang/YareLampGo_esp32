@@ -4,9 +4,22 @@ Firmware for the LampGo ESP32 camera, microphone, speaker, LED, and WiFi provisi
 
 中文烧录指南：[`README.zh-CN.md`](README.zh-CN.md)
 
-The legacy target is `XIAO_ESP32S3` with OPI PSRAM enabled. The new integrated
-ESP32-P4 head-board runtime lives in [`ESP32_P4_HEAD/`](ESP32_P4_HEAD/) and has
-its own build and safety instructions.
+## Choose a hardware target first
+
+This repository intentionally contains two **parallel** firmware targets. The
+P4 target does not replace the legacy S3/C6 device, and their images, C6 roles,
+partition tables, and flashing commands must not be mixed.
+
+| Hardware route | Firmware entry point | What the C6 does | Flash this |
+| --- | --- | --- | --- |
+| **Legacy S3 + standalone C6 display** | Repository root + `ESP32_C6_LCD_1_47_UART/` | Drives the LCD and receives expression assets from S3 over UART | This root sketch through `scripts/flash.sh`; the C6 display sketch separately. |
+| **ESP32-P4 head + C6 Wi-Fi** | [`ESP32_P4_HEAD/`](ESP32_P4_HEAD/) | P4 network coprocessor over ESP-Hosted/SDIO | Only the P4 sketch and its custom partition table. Do **not** flash the C6 display sketch. |
+
+Legacy users should stay on the root `XIAO_ESP32S3` target and the backend's
+default `motor_transport = "serial"`. P4 users must explicitly select
+`motor_transport = "p4"` in the backend; see the [P4 head runtime guide](ESP32_P4_HEAD/README.md).
+
+The remainder of this README documents the **legacy S3 target**.
 
 ## License
 

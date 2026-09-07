@@ -4,6 +4,22 @@ This sketch moves all time-critical head I/O to the P4. The computer runs the
 LampGo backend and talks to one paired device over the P4/C6 network link; it no
 longer opens the servo bus over USB.
 
+## This is a parallel target, not an S3/C6 replacement flash
+
+Use this directory only for the **ESP32-P4 head-board + C6 Wi-Fi** hardware.
+It coexists with the legacy `XIAO_ESP32S3` root sketch and
+`ESP32_C6_LCD_1_47_UART/` display sketch:
+
+| Route | C6 role | Asset route | Backend motor setting |
+| --- | --- | --- | --- |
+| Legacy S3 + C6 display | LCD controller over UART | backend → S3 → C6 | `serial` (default) |
+| This P4 head board | P4 network coprocessor over ESP-Hosted/SDIO | backend → P4 LittleFS → P4 LCD/LED | `p4` (explicit opt-in) |
+
+Do not flash `ESP32_C6_LCD_1_47_UART` onto the C6 used by this board, do not
+run the root `scripts/flash.sh` for this target, and do not enter P4's native
+USB debug port as the legacy Feetech motor-bus port. The backend's configuration
+and rollback instructions are in the main repository's P4 wireless-head guide.
+
 ```text
 backend -- HTTP/WS over Wi-Fi --> ESP32-C6 -- internal SDIO --> ESP32-P4
                                                               |-- ST3215 x5
@@ -32,6 +48,21 @@ arduino-cli compile \
   --fqbn 'esp32:esp32:esp32p4:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=custom,PSRAM=enabled,ChipVariant=prev3' \
   ESP32_P4_HEAD
 ```
+
+To upload through the P4's native USB CDC port after a successful build, use
+the same FQBN and the port reported by your system (for example
+`/dev/cu.usbmodem101` on macOS):
+
+```bash
+arduino-cli upload \
+  --port /dev/cu.usbmodem101 \
+  --fqbn 'esp32:esp32:esp32p4:USBMode=hwcdc,CDCOnBoot=cdc,FlashSize=16M,PartitionScheme=custom,PSRAM=enabled,ChipVariant=prev3' \
+  ESP32_P4_HEAD
+```
+
+Do not erase a working board as part of an ordinary update: Wi-Fi and pairing
+state live in NVS. A first install or intentional recovery may require a clean
+flash, followed by provisioning and a new pairing.
 
 The custom partition table keeps two 5 MiB OTA slots and a LittleFS asset
 partition. This P4 image deliberately does not bundle a WakeNet model
