@@ -14,6 +14,10 @@ namespace {
 constexpr size_t kMaxEyeBytes = 512 * 1024;
 constexpr size_t kMaxLedBytes = 8 * 1024;
 constexpr char kContentTypeHeader[] = "Content-Type";
+constexpr char kOwnerHeader[] = "X-Lampgo-Owner";
+constexpr char kTokenHeader[] = "X-Lampgo-Token";
+constexpr char kClipIdHeader[] = "X-Lampgo-Clip-Id";
+constexpr char kEffectIdHeader[] = "X-Lampgo-Effect-Id";
 
 uint32_t parseColor(String value) {
   value.trim();
@@ -32,11 +36,11 @@ DeviceHttp::DeviceHttp(PairingStore& pairing, ServoExecutor& servos,
       audio_(audio), hostname_(hostname), server_(BoardConfig::kHttpPort) {}
 
 void DeviceHttp::begin() {
-  // The upload callback is also invoked for raw request bodies in
-  // Arduino-ESP32 3.3.x.  Keep the content type so that a raw request is
-  // rejected safely instead of dereferencing the multipart upload object.
-  const char* headers[] = {kContentTypeHeader};
-  server_.collectHeaders(headers, 1);
+  // Raw body callbacks run before WebServer parses query arguments.  Retain
+  // the headers that identify the paired owner and target asset.
+  const char* headers[] = {kContentTypeHeader, kOwnerHeader, kTokenHeader,
+                           kClipIdHeader, kEffectIdHeader};
+  server_.collectHeaders(headers, 5);
   registerRoutes();
   server_.begin();
   Serial.printf("[HTTP READY] http://%s/\n", hostname_.c_str());
@@ -521,57 +525,68 @@ void DeviceHttp::handleAssetDelete(UploadKind kind) {
 
 void DeviceHttp::handleUploadData(UploadKind kind) {
   if (!server_.header(kContentTypeHeader).startsWith("multipart/")) {
-    // ``WebServer::on(..., uploadHandler)`` calls this handler for raw bodies
-    // too.  Those bodies have ``HTTPRaw`` state, not ``HTTPUpload`` state;
-    // accessing server_.upload() here crashes the HTTP task for larger clips.
-    if (server_.raw().status == RAW_START) {
-      uploadKind_ = kind;
-      uploadOk_ = false;
-      uploadError_ = "multipart asset upload required";
-      Serial.printf("[HTTP UPLOAD] rejected raw body kind=%s bytes=%u\n",
-                    kind == UploadKind::kEye ? "eye" : "led",
-                    static_cast<unsigned int>(server_.clientContentLength()));
+    HTTPRaw& raw = server_.raw();
+    if (raw.status == RAW_START) {
+      const String id = kind == UploadKind::kEye ? server_.header(kClipIdHeader) :
+                                                   server_.header(kEffectIdHeader);
+      startUpload(kind, id);
+    } else if (raw.status == RAW_WRITE) {
+      appendUpload(kind, raw.buf, raw.currentSize);
+    } else if (raw.status == RAW_END || raw.status == RAW_ABORTED) {
+      endUpload(kind, raw.status == RAW_ABORTED);
     }
     return;
   }
 
   HTTPUpload& upload = server_.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    uploadKind_ = kind;
-    uploadId_ = server_.arg(kind == UploadKind::kEye ? "clip_id" : "effect_id");
-    uploadTempPath_ = kind == UploadKind::kEye ? "/upload_eye.tmp" : "/upload_led.tmp";
-    uploadBytes_ = 0;
-    uploadOk_ = authorizeRequest() && ExpressionCoordinator::safeAssetId(uploadId_);
-    uploadError_ = uploadOk_ ? "" : "unauthorized or invalid asset id";
-    if (uploadOk_) {
-      LittleFS.remove(uploadTempPath_);
-      uploadFile_ = LittleFS.open(uploadTempPath_, "w");
-    }
-    if (uploadOk_ && !uploadFile_) {
-      uploadOk_ = false;
-      uploadError_ = "cannot open upload file";
-    }
-    Serial.printf("[HTTP UPLOAD] start kind=%s id=%s accepted=%d\n",
-                  kind == UploadKind::kEye ? "eye" : "led", uploadId_.c_str(), uploadOk_);
+    startUpload(kind, server_.arg(kind == UploadKind::kEye ? "clip_id" : "effect_id"));
   } else if (upload.status == UPLOAD_FILE_WRITE && uploadOk_) {
-    const size_t limit = kind == UploadKind::kEye ? kMaxEyeBytes : kMaxLedBytes;
-    if (uploadBytes_ + upload.currentSize > limit ||
-        uploadFile_.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      uploadOk_ = false;
-      uploadError_ = "asset exceeds limit or storage write failed";
-    } else {
-      uploadBytes_ += upload.currentSize;
-    }
+    appendUpload(kind, upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
-    if (uploadFile_) uploadFile_.close();
-    if (upload.status == UPLOAD_FILE_ABORTED) {
-      uploadOk_ = false;
-      uploadError_ = "upload aborted";
-    }
-    Serial.printf("[HTTP UPLOAD] end kind=%s bytes=%u ok=%d\n",
-                  kind == UploadKind::kEye ? "eye" : "led",
-                  static_cast<unsigned int>(uploadBytes_), uploadOk_);
+    endUpload(kind, upload.status == UPLOAD_FILE_ABORTED);
   }
+}
+
+void DeviceHttp::startUpload(UploadKind kind, const String& assetId) {
+  uploadKind_ = kind;
+  uploadId_ = assetId;
+  uploadTempPath_ = kind == UploadKind::kEye ? "/upload_eye.tmp" : "/upload_led.tmp";
+  uploadBytes_ = 0;
+  uploadOk_ = authorizeRequest() && ExpressionCoordinator::safeAssetId(uploadId_);
+  uploadError_ = uploadOk_ ? "" : "unauthorized or invalid asset id";
+  if (uploadOk_) {
+    LittleFS.remove(uploadTempPath_);
+    uploadFile_ = LittleFS.open(uploadTempPath_, "w");
+  }
+  if (uploadOk_ && !uploadFile_) {
+    uploadOk_ = false;
+    uploadError_ = "cannot open upload file";
+  }
+  Serial.printf("[HTTP UPLOAD] start kind=%s id=%s accepted=%d\n",
+                kind == UploadKind::kEye ? "eye" : "led", uploadId_.c_str(), uploadOk_);
+}
+
+void DeviceHttp::appendUpload(UploadKind kind, const uint8_t* data, size_t size) {
+  if (!uploadOk_) return;
+  const size_t limit = kind == UploadKind::kEye ? kMaxEyeBytes : kMaxLedBytes;
+  if (uploadBytes_ + size > limit || uploadFile_.write(data, size) != size) {
+    uploadOk_ = false;
+    uploadError_ = "asset exceeds limit or storage write failed";
+    return;
+  }
+  uploadBytes_ += size;
+}
+
+void DeviceHttp::endUpload(UploadKind kind, bool aborted) {
+  if (uploadFile_) uploadFile_.close();
+  if (aborted) {
+    uploadOk_ = false;
+    uploadError_ = "upload aborted";
+  }
+  Serial.printf("[HTTP UPLOAD] end kind=%s bytes=%u ok=%d\n",
+                kind == UploadKind::kEye ? "eye" : "led",
+                static_cast<unsigned int>(uploadBytes_), uploadOk_);
 }
 
 void DeviceHttp::finishUpload(UploadKind kind) {
@@ -668,7 +683,11 @@ bool DeviceHttp::authorize(JsonObjectConst body) const {
 }
 
 bool DeviceHttp::authorizeRequest() const {
-  return pairing_.authorize(server_.arg("owner"), server_.arg("token"));
+  const String owner = server_.header(kOwnerHeader).isEmpty() ? server_.arg("owner") :
+                                                              server_.header(kOwnerHeader);
+  const String token = server_.header(kTokenHeader).isEmpty() ? server_.arg("token") :
+                                                              server_.header(kTokenHeader);
+  return pairing_.authorize(owner, token);
 }
 
 bool DeviceHttp::validateStoredAsset(UploadKind kind, const String& path, String& error) const {
