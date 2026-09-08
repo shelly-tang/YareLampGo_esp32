@@ -15,6 +15,14 @@ class PixelStrip {
                   uint32_t startAtMs = 0);
   void showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness,
                  uint32_t startAtMs = 0);
+  // These values match LampGo's backend ocean controller, allowing wrist
+  // telemetry to drive the P4's full rectangular panel without a remap.
+  void startOcean(uint32_t color, uint8_t brightness, uint8_t fillPercent,
+                  uint16_t sensitivityPercent, uint8_t edgeHighlightPercent,
+                  uint16_t tiltPercent, uint16_t impactPercent, uint16_t dampingPercent,
+                  uint32_t startAtMs = 0);
+  void updateOcean(float angleDeg, float angularVelocityDps, uint32_t sequence);
+  void stopOcean(uint32_t startAtMs = 0);
   // Shows fixed physical LED indices for a visual wiring/orientation check.
   // It never passes through the logical mirror transform.
   void showTopologyTest(uint8_t brightness, uint32_t startAtMs = 0);
@@ -24,7 +32,15 @@ class PixelStrip {
   uint8_t brightness() const { return brightness_; }
 
  private:
-  enum class CommandType : uint8_t { kMode, kEffect, kClock, kTopologyTest };
+  enum class CommandType : uint8_t {
+    kMode,
+    kEffect,
+    kClock,
+    kTopologyTest,
+    kOceanStart,
+    kOceanInput,
+    kOceanStop,
+  };
   struct Command {
     CommandType type;
     uint8_t mode;
@@ -34,6 +50,15 @@ class PixelStrip {
     uint32_t color;
     uint8_t hour;
     uint8_t minute;
+    uint8_t fillPercent;
+    uint16_t sensitivityPercent;
+    uint8_t edgeHighlightPercent;
+    uint16_t tiltPercent;
+    uint16_t impactPercent;
+    uint16_t dampingPercent;
+    int16_t angleTenths;
+    int16_t velocityTenths;
+    uint32_t sequence;
     char path[48];
   };
 
@@ -43,6 +68,7 @@ class PixelStrip {
   bool openEffect(const char* path, bool loop);
   void renderEffect(uint32_t phase);
   void renderClock(uint32_t phase);
+  void renderOcean(uint32_t phase);
   void renderTopologyTest();
   void transmit();
   void clear();
@@ -59,6 +85,7 @@ class PixelStrip {
   uint8_t effectTicks_ = 0;
   uint8_t effectFrames_ = 0;
   uint8_t effectColors_ = 0;
+  uint8_t effectWidth_ = 0;
   uint16_t effectFrameBytes_ = 0;
   size_t effectPaletteOffset_ = 0;
   size_t effectTimelineOffset_ = 0;
@@ -67,9 +94,20 @@ class PixelStrip {
   bool effectLoop_ = false;
   bool clockActive_ = false;
   bool topologyTestActive_ = false;
+  bool oceanActive_ = false;
   uint32_t clockColor_ = 0xFFFFFF;
   uint8_t clockHour_ = 0;
   uint8_t clockMinute_ = 0;
+  uint32_t oceanColor_ = 0x37D6FF;
+  uint8_t oceanFillPercent_ = 45;
+  uint16_t oceanSensitivityPercent_ = 100;
+  uint8_t oceanEdgeHighlightPercent_ = 45;
+  uint16_t oceanTiltPercent_ = 100;
+  uint16_t oceanImpactPercent_ = 100;
+  uint16_t oceanDampingPercent_ = 130;
+  float oceanAngleDeg_ = 0.0f;
+  float oceanAngularVelocityDps_ = 0.0f;
+  uint32_t oceanSequence_ = 0;
   void* symbols_ = nullptr;
   uint8_t mode_ = 0;
   uint8_t brightness_ = 1;

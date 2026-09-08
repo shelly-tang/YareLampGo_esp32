@@ -65,6 +65,31 @@ void ExpressionCoordinator::showClock(uint8_t hour, uint8_t minute, uint32_t col
   currentBrightness_ = brightness;
 }
 
+void ExpressionCoordinator::startOcean(uint32_t color, uint8_t brightness, uint8_t fillPercent,
+                                       uint16_t sensitivityPercent, uint8_t edgeHighlightPercent,
+                                       uint16_t tiltPercent, uint16_t impactPercent,
+                                       uint16_t dampingPercent) {
+  pixels_.startOcean(color, brightness, fillPercent, sensitivityPercent, edgeHighlightPercent,
+                     tiltPercent, impactPercent, dampingPercent, millis() + 20);
+  currentMode_ = 0;
+  currentEyeClip_.clear();
+  currentLedEffect_.clear();
+  currentBrightness_ = brightness;
+}
+
+void ExpressionCoordinator::updateOcean(float angleDeg, float angularVelocityDps,
+                                        uint32_t sequence) {
+  pixels_.updateOcean(angleDeg, angularVelocityDps, sequence);
+}
+
+void ExpressionCoordinator::stopOcean() {
+  pixels_.stopOcean(millis() + 20);
+  currentMode_ = 0;
+  currentEyeClip_.clear();
+  currentLedEffect_.clear();
+  currentBrightness_ = 1;
+}
+
 void ExpressionCoordinator::showLedTopologyTest(uint8_t brightness) {
   pixels_.showTopologyTest(brightness, millis() + 20);
   currentMode_ = 0;

@@ -39,6 +39,7 @@ class DeviceHttp {
   void handleLed();
   void handleLedStatus();
   void handleClock();
+  void handleOcean();
   void handleExpressionPlay();
   void handleExpressionStop();
   void handleAssetList(UploadKind kind);

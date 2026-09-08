@@ -7,7 +7,7 @@
 
 namespace BoardConfig {
 
-constexpr char kFirmwareVersion[] = "p4-head-0.1.1";
+constexpr char kFirmwareVersion[] = "p4-head-0.2.0";
 constexpr char kMotionProtocol[] = "lampgo-motion-v1";
 
 constexpr int kServoTx = 31;

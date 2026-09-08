@@ -3,6 +3,8 @@
 
 #include "device_http.h"
 
+#include <algorithm>
+
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -64,6 +66,16 @@ uint32_t parseColor(String value) {
   char* end = nullptr;
   const uint32_t result = strtoul(value.c_str(), &end, 16);
   return end && *end == '\0' ? result : 0xFFFFFF;
+}
+
+uint8_t percent(JsonVariantConst value, uint8_t fallback) {
+  if (value.isNull()) return fallback;
+  return static_cast<uint8_t>(std::max(0, std::min(100, value.as<int>())));
+}
+
+uint16_t range(JsonVariantConst value, uint16_t fallback, uint16_t minimum, uint16_t maximum) {
+  if (value.isNull()) return fallback;
+  return static_cast<uint16_t>(std::max<int>(minimum, std::min<int>(maximum, value.as<int>())));
 }
 }  // namespace
 
@@ -134,6 +146,7 @@ void DeviceHttp::registerRoutes() {
       [this]() { finishUploadRequest(UploadKind::kLed); },
       [this]() { handleUploadData(UploadKind::kLed); });
   server_.on("/device/clock", HTTP_POST, [this]() { handleClock(); });
+  server_.on("/device/ocean", HTTP_POST, [this]() { handleOcean(); });
   server_.on("/api/wifi", HTTP_POST, [this]() { handleConnect(); });
   server_.on("/device/forget-wifi", HTTP_POST, [this]() { handleForgetWifi(); });
   server_.on("/device/reboot", HTTP_POST, [this]() { handleReboot(); });
@@ -508,6 +521,41 @@ void DeviceHttp::handleClock() {
   }
   JsonDocument response;
   response["ok"] = true;
+  sendJson(200, response);
+}
+
+void DeviceHttp::handleOcean() {
+  JsonDocument request;
+  if (!parseJson(request)) return;
+  JsonObjectConst body = request.as<JsonObjectConst>();
+  if (!authorize(body)) {
+    sendError(403, "pairing mismatch");
+    return;
+  }
+
+  const String action = body["action"] | "";
+  if (action == "start") {
+    expressions_.startOcean(
+        parseColor(String(body["color"] | "#37d6ff")),
+        static_cast<uint8_t>(std::max(1, std::min<int>(
+            BoardConfig::kLedSafeBrightness, body["brightness"] | BoardConfig::kLedSafeBrightness))),
+        percent(body["fill_percent"], 55), range(body["sensitivity_percent"], 100, 25, 200),
+        percent(body["edge_highlight_percent"], 75), range(body["tilt_percent"], 100, 50, 160),
+        range(body["impact_percent"], 100, 0, 200), range(body["damping_percent"], 130, 80, 200));
+  } else if (action == "input") {
+    expressions_.updateOcean(body["angle_deg"] | 0.0f,
+                             body["angular_velocity_dps"] | 0.0f,
+                             body["sequence"] | 0U);
+  } else if (action == "stop") {
+    expressions_.stopOcean();
+  } else {
+    sendError(400, "ocean action must be start, input, or stop");
+    return;
+  }
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["action"] = action;
   sendJson(200, response);
 }
 

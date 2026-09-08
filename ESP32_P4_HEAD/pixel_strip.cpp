@@ -14,7 +14,6 @@ namespace {
 constexpr uint32_t kRmtFrequency = 10000000;
 constexpr uint16_t kFramePeriodMs = 40;
 constexpr uint8_t kLegacyRowLengths[] = {47, 49, 51, 51, 51, 51, 51, 49, 47};
-constexpr uint16_t kLegacyPixelCount = 447;
 constexpr size_t kEffectHeaderBytes = 32;
 
 uint16_t readU16(const uint8_t* data) {
@@ -89,6 +88,46 @@ void PixelStrip::showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t
   xQueueOverwrite(queue_, &command);
 }
 
+void PixelStrip::startOcean(uint32_t color, uint8_t brightness, uint8_t fillPercent,
+                            uint16_t sensitivityPercent, uint8_t edgeHighlightPercent,
+                            uint16_t tiltPercent, uint16_t impactPercent, uint16_t dampingPercent,
+                            uint32_t startAtMs) {
+  if (!queue_) return;
+  Command command{};
+  command.type = CommandType::kOceanStart;
+  command.brightness = static_cast<uint8_t>(
+      std::max<int>(1, std::min<int>(brightness, BoardConfig::kLedSafeBrightness)));
+  command.startAtMs = startAtMs;
+  command.color = color;
+  command.fillPercent = std::min<uint8_t>(fillPercent, 100);
+  command.sensitivityPercent = std::max<uint16_t>(25, std::min<uint16_t>(sensitivityPercent, 200));
+  command.edgeHighlightPercent = std::min<uint8_t>(edgeHighlightPercent, 100);
+  command.tiltPercent = std::max<uint16_t>(50, std::min<uint16_t>(tiltPercent, 160));
+  command.impactPercent = std::min<uint16_t>(impactPercent, 200);
+  command.dampingPercent = std::max<uint16_t>(80, std::min<uint16_t>(dampingPercent, 200));
+  xQueueOverwrite(queue_, &command);
+}
+
+void PixelStrip::updateOcean(float angleDeg, float angularVelocityDps, uint32_t sequence) {
+  if (!queue_) return;
+  Command command{};
+  command.type = CommandType::kOceanInput;
+  command.angleTenths = static_cast<int16_t>(
+      std::max(-350.0f, std::min(350.0f, angleDeg)) * 10.0f);
+  command.velocityTenths = static_cast<int16_t>(
+      std::max(-1800.0f, std::min(1800.0f, angularVelocityDps)) * 10.0f);
+  command.sequence = sequence;
+  xQueueOverwrite(queue_, &command);
+}
+
+void PixelStrip::stopOcean(uint32_t startAtMs) {
+  if (!queue_) return;
+  Command command{};
+  command.type = CommandType::kOceanStop;
+  command.startAtMs = startAtMs;
+  xQueueOverwrite(queue_, &command);
+}
+
 void PixelStrip::showTopologyTest(uint8_t brightness, uint32_t startAtMs) {
   if (!queue_) return;
   Command command{};
@@ -111,19 +150,46 @@ void PixelStrip::taskLoop() {
   for (;;) {
     Command command{};
     if (xQueueReceive(queue_, &command, 0) == pdTRUE) {
-      mode_ = command.mode;
-      brightness_ = command.brightness;
-      effectActive_ = command.type == CommandType::kEffect && openEffect(command.path, command.loop);
-      clockActive_ = command.type == CommandType::kClock;
-      topologyTestActive_ = command.type == CommandType::kTopologyTest;
-      if (clockActive_) {
-        clockHour_ = command.hour;
-        clockMinute_ = command.minute;
-        clockColor_ = command.color;
+      if (command.type == CommandType::kOceanInput) {
+        // Ignore reordered telemetry so a delayed browser/device packet cannot
+        // make the water visibly jump backwards.
+        if (command.sequence >= oceanSequence_) {
+          oceanAngleDeg_ = static_cast<float>(command.angleTenths) / 10.0f;
+          oceanAngularVelocityDps_ = static_cast<float>(command.velocityTenths) / 10.0f;
+          oceanSequence_ = command.sequence;
+        }
+      } else {
+        mode_ = command.mode;
+        brightness_ = command.brightness;
+        effectActive_ = command.type == CommandType::kEffect && openEffect(command.path, command.loop);
+        clockActive_ = command.type == CommandType::kClock;
+        topologyTestActive_ = command.type == CommandType::kTopologyTest;
+        oceanActive_ = command.type == CommandType::kOceanStart;
+        if (clockActive_) {
+          clockHour_ = command.hour;
+          clockMinute_ = command.minute;
+          clockColor_ = command.color;
+        }
+        if (oceanActive_) {
+          oceanColor_ = command.color;
+          oceanFillPercent_ = command.fillPercent;
+          oceanSensitivityPercent_ = command.sensitivityPercent;
+          oceanEdgeHighlightPercent_ = command.edgeHighlightPercent;
+          oceanTiltPercent_ = command.tiltPercent;
+          oceanImpactPercent_ = command.impactPercent;
+          oceanDampingPercent_ = command.dampingPercent;
+          oceanAngleDeg_ = 0.0f;
+          oceanAngularVelocityDps_ = 0.0f;
+          oceanSequence_ = 0;
+        }
+        if (command.type == CommandType::kOceanStop) {
+          mode_ = 0;
+          brightness_ = 1;
+        }
+        startAt = command.startAtMs;
+        phase = 0;
+        nextFrame = std::max(millis(), startAt);
       }
-      startAt = command.startAtMs;
-      phase = 0;
-      nextFrame = std::max(millis(), startAt);
     }
     const uint32_t now = millis();
     if (static_cast<int32_t>(now - nextFrame) >= 0 && static_cast<int32_t>(now - startAt) >= 0) {
@@ -131,6 +197,8 @@ void PixelStrip::taskLoop() {
         renderTopologyTest();
       } else if (clockActive_) {
         renderClock(phase++);
+      } else if (oceanActive_) {
+        renderOcean(phase++);
       } else if (effectActive_) {
         renderEffect(phase++);
         if (!effectLoop_ && phase >= effectTicks_) effectActive_ = false;
@@ -145,12 +213,20 @@ void PixelStrip::taskLoop() {
 }
 
 void PixelStrip::renderClock(uint32_t phase) {
-  static constexpr uint8_t kDigits[10][5] = {
-      {0b111, 0b101, 0b101, 0b101, 0b111}, {0b010, 0b110, 0b010, 0b010, 0b111},
-      {0b111, 0b001, 0b111, 0b100, 0b111}, {0b111, 0b001, 0b111, 0b001, 0b111},
-      {0b101, 0b101, 0b111, 0b001, 0b001}, {0b111, 0b100, 0b111, 0b001, 0b111},
-      {0b111, 0b100, 0b111, 0b101, 0b111}, {0b111, 0b001, 0b010, 0b010, 0b010},
-      {0b111, 0b101, 0b111, 0b101, 0b111}, {0b111, 0b101, 0b111, 0b001, 0b111},
+  // Five-by-seven numerals use the rectangular panel deliberately: the old
+  // 3x5 clock was designed for the tapered 51x9 matrix and looked undersized
+  // on a full-width 54x9 board.
+  static constexpr uint8_t kDigits[10][7] = {
+      {0b11111, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b11111},
+      {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
+      {0b11110, 0b00001, 0b00001, 0b01110, 0b10000, 0b10000, 0b11111},
+      {0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110},
+      {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
+      {0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110},
+      {0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110},
+      {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
+      {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
+      {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110},
   };
   clear();
   const uint8_t red = clockColor_ >> 16;
@@ -160,22 +236,59 @@ void PixelStrip::renderClock(uint32_t phase) {
                              static_cast<uint8_t>(clockHour_ % 10),
                              static_cast<uint8_t>(clockMinute_ / 10),
                              static_cast<uint8_t>(clockMinute_ % 10)};
-  constexpr int kStartX = (BoardConfig::kLedWidth - 17) / 2;
-  constexpr int kStartY = 2;
-  constexpr uint8_t kDigitX[4] = {0, 4, 10, 14};
+  constexpr int kClockWidth = 25;
+  constexpr int kStartX = (BoardConfig::kLedWidth - kClockWidth) / 2;
+  constexpr int kStartY = 1;
+  constexpr uint8_t kDigitX[4] = {0, 6, 14, 20};
   for (uint8_t digit = 0; digit < 4; ++digit) {
     const int x = kStartX + kDigitX[digit];
-    for (uint8_t row = 0; row < 5; ++row) {
-      for (uint8_t column = 0; column < 3; ++column) {
-        if (kDigits[values[digit]][row] & (1U << (2 - column))) {
+    for (uint8_t row = 0; row < 7; ++row) {
+      for (uint8_t column = 0; column < 5; ++column) {
+        if (kDigits[values[digit]][row] & (1U << (4 - column))) {
           setPixel(kStartY + row, x + column, red, green, blue);
         }
       }
     }
   }
   if ((phase / 12) % 2 == 0) {
-    setPixel(kStartY + 1, kStartX + 8, red, green, blue);
-    setPixel(kStartY + 3, kStartX + 8, red, green, blue);
+    setPixel(kStartY + 2, kStartX + 12, red, green, blue);
+    setPixel(kStartY + 5, kStartX + 12, red, green, blue);
+  }
+}
+
+void PixelStrip::renderOcean(uint32_t phase) {
+  clear();
+  const uint8_t red = oceanColor_ >> 16;
+  const uint8_t green = oceanColor_ >> 8;
+  const uint8_t blue = oceanColor_;
+  const float fillRows = static_cast<float>(BoardConfig::kLedHeight) * oceanFillPercent_ / 100.0f;
+  const float baseLine = static_cast<float>(BoardConfig::kLedHeight) - fillRows;
+  const float tilt = oceanAngleDeg_ / 35.0f * oceanTiltPercent_ / 160.0f * 3.0f;
+  const float motion = std::min(1.0f, fabsf(oceanAngularVelocityDps_) / 180.0f);
+  const float amplitude = 0.35f + oceanImpactPercent_ / 200.0f * (0.45f + 1.2f * motion);
+  const float damping = 0.05f + (200.0f - oceanDampingPercent_) / 120.0f * 0.22f;
+  const float speed = 0.06f + oceanSensitivityPercent_ / 200.0f * 0.22f;
+  const float time = phase * speed;
+  const uint8_t edgeScale = 70 + oceanEdgeHighlightPercent_ * 185 / 100;
+
+  for (int column = 0; column < BoardConfig::kLedWidth; ++column) {
+    const float position = static_cast<float>(column) / (BoardConfig::kLedWidth - 1) * 2.0f - 1.0f;
+    const float wave = sinf(column * 0.34f + time) * amplitude +
+                       sinf(column * 0.13f - time * 0.67f) * amplitude * damping * 2.0f;
+    const int waterLine = static_cast<int>(roundf(std::max(0.0f, std::min(
+        static_cast<float>(BoardConfig::kLedHeight), baseLine + position * tilt + wave))));
+    for (int row = waterLine; row < BoardConfig::kLedHeight; ++row) {
+      const uint8_t depthScale = static_cast<uint8_t>(
+          150 + (row - waterLine) * 105 / std::max(1, BoardConfig::kLedHeight - waterLine));
+      setPixel(row, column, static_cast<uint16_t>(red) * depthScale / 255,
+               static_cast<uint16_t>(green) * depthScale / 255,
+               static_cast<uint16_t>(blue) * depthScale / 255);
+    }
+    if (waterLine >= 0 && waterLine < BoardConfig::kLedHeight) {
+      setPixel(waterLine, column, static_cast<uint16_t>(red) * edgeScale / 255,
+               static_cast<uint16_t>(green) * edgeScale / 255,
+               static_cast<uint16_t>(blue) * edgeScale / 255);
+    }
   }
 }
 
@@ -198,19 +311,22 @@ bool PixelStrip::openEffect(const char* path, bool loop) {
   effectSize_ = file.read(effectData_, sizeof(effectData_));
   file.close();
   if (effectSize_ < kEffectHeaderBytes || memcmp(effectData_, "LEF1", 4) != 0 ||
-      effectData_[4] != 1 || effectData_[5] != 51 || effectData_[6] != 9 ||
-      effectData_[7] != 10) {
+      effectData_[4] != 1 ||
+      (effectData_[5] != 51 && effectData_[5] != BoardConfig::kLedWidth) ||
+      effectData_[6] != BoardConfig::kLedHeight || effectData_[7] != 10) {
     return false;
   }
+  effectWidth_ = effectData_[5];
   effectTicks_ = effectData_[8];
   effectFrames_ = effectData_[9];
   effectColors_ = effectData_[10];
   effectFrameBytes_ = readU16(effectData_ + 12);
   const uint16_t headerBytes = readU16(effectData_ + 14);
   const uint32_t payloadBytes = readU32(effectData_ + 16);
+  const uint16_t effectPixels = effectWidth_ * BoardConfig::kLedHeight;
   if (headerBytes != kEffectHeaderBytes || effectTicks_ == 0 || effectTicks_ > 30 ||
       effectFrames_ == 0 || effectFrames_ > 30 || effectColors_ == 0 || effectColors_ > 16 ||
-      effectFrameBytes_ != (kLegacyPixelCount + 1) / 2 ||
+      effectFrameBytes_ != (effectPixels + 1) / 2 ||
       static_cast<size_t>(headerBytes) + payloadBytes != effectSize_) {
     return false;
   }
@@ -231,6 +347,20 @@ void PixelStrip::renderEffect(uint32_t phase) {
   const uint8_t tick = effectLoop_ ? phase % effectTicks_ : std::min<uint32_t>(phase, effectTicks_ - 1);
   const uint8_t frameIndex = effectData_[effectTimelineOffset_ + tick];
   const uint8_t* frame = effectData_ + effectFramesOffset_ + frameIndex * effectFrameBytes_;
+  if (effectWidth_ == BoardConfig::kLedWidth) {
+    // Native P4 assets are already packed in this panel's serpentine physical
+    // order.  They use all 486 pixels and must not pass through the legacy
+    // tapered 51-column transform below.
+    for (uint16_t index = 0; index < BoardConfig::kLedCount; ++index) {
+      const uint8_t packed = frame[index / 2];
+      const uint8_t paletteIndex =
+          (index & 1) ? packed & 0x0F : static_cast<uint8_t>(packed >> 4);
+      if (paletteIndex >= effectColors_) continue;
+      const uint8_t* color = effectData_ + effectPaletteOffset_ + paletteIndex * 3U;
+      setPixelPhysical(index, color[0], color[1], color[2]);
+    }
+    return;
+  }
   // LEF1 v1 is the historical 447-pixel S3 layout.  Its bytes are in wired
   // order (bottom/right-facing), not editor row order.  Decode that legacy
   // transform first, then centre its 51-column canvas on the P4's 54-column
@@ -276,8 +406,13 @@ void PixelStrip::render(uint8_t mode, uint32_t phase) {
     const uint8_t red = mode == 6 ? 255 : mode == 5 ? 180 : 0;
     const uint8_t green = mode == 7 ? 255 : mode == 5 ? 90 : 0;
     const uint8_t blue = mode == 8 ? 255 : mode == 5 ? 255 : 0;
-    for (int index = phase % 3; index < BoardConfig::kLedCount; index += 3) {
-      setPixelPhysical(index, red, green, blue);
+    // Advance logical columns, not physical indices.  The latter zig-zagged
+    // through every odd serpentine row and made the rectangular panel look
+    // corrupted despite correct wiring.
+    for (int column = phase % 3; column < BoardConfig::kLedWidth; column += 3) {
+      for (int row = 0; row < BoardConfig::kLedHeight; ++row) {
+        setPixel(row, column, red, green, blue);
+      }
     }
     return;
   }
