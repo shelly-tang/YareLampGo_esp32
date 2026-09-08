@@ -7,6 +7,12 @@
 
 #include "board_config.h"
 
+enum class ClockEffect : uint8_t {
+  kSteady,
+  kBlink,
+  kOrbit,
+};
+
 class PixelStrip {
  public:
   bool begin();
@@ -14,7 +20,7 @@ class PixelStrip {
   void playEffect(const char* path, uint8_t fallbackMode, uint8_t brightness, bool loop,
                   uint32_t startAtMs = 0);
   void showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness,
-                 uint32_t startAtMs = 0);
+                 ClockEffect effect = ClockEffect::kSteady, uint32_t startAtMs = 0);
   // These values match LampGo's backend ocean controller, allowing wrist
   // telemetry to drive the P4's full rectangular panel without a remap.
   void startOcean(uint32_t color, uint8_t brightness, uint8_t fillPercent,
@@ -50,6 +56,7 @@ class PixelStrip {
     uint32_t color;
     uint8_t hour;
     uint8_t minute;
+    ClockEffect clockEffect;
     uint8_t fillPercent;
     uint16_t sensitivityPercent;
     uint8_t edgeHighlightPercent;
@@ -93,6 +100,7 @@ class PixelStrip {
   bool effectActive_ = false;
   bool effectLoop_ = false;
   bool clockActive_ = false;
+  ClockEffect clockEffect_ = ClockEffect::kSteady;
   bool topologyTestActive_ = false;
   bool oceanActive_ = false;
   uint32_t clockColor_ = 0xFFFFFF;

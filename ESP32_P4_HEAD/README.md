@@ -4,6 +4,9 @@ This sketch moves all time-critical head I/O to the P4. The computer runs the
 LampGo backend and talks to one paired device over the P4/C6 network link; it no
 longer opens the servo bus over USB.
 
+Recent P4-specific runtime changes are summarized in
+[the Chinese update log](CHANGELOG.zh-CN.md).
+
 ## This is a parallel target, not an S3/C6 replacement flash
 
 Use this directory only for the **ESP32-P4 head-board + C6 Wi-Fi** hardware.

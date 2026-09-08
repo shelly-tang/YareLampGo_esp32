@@ -13,6 +13,11 @@
 namespace {
 constexpr uint32_t kRmtFrequency = 10000000;
 constexpr uint16_t kFramePeriodMs = 40;
+// A 486-pixel frame has 11,664 symbols. Reserve all four P4 TX memory blocks
+// (192 symbols) instead of the Arduino default of 48, reducing refill pressure
+// fourfold without competing for the GDMA channels used by camera, I2S and
+// ESP-Hosted.
+constexpr rmt_reserve_memsize_t kRmtMemoryBlocks = RMT_MEM_NUM_BLOCKS_4;
 constexpr uint8_t kLegacyRowLengths[] = {47, 49, 51, 51, 51, 51, 51, 49, 47};
 constexpr size_t kEffectHeaderBytes = 32;
 
@@ -27,7 +32,7 @@ uint32_t readU32(const uint8_t* data) {
 }  // namespace
 
 bool PixelStrip::begin() {
-  if (!rmtInit(BoardConfig::kLedData, RMT_TX_MODE, RMT_MEM_NUM_BLOCKS_1, kRmtFrequency)) {
+  if (!rmtInit(BoardConfig::kLedData, RMT_TX_MODE, kRmtMemoryBlocks, kRmtFrequency)) {
     return false;
   }
   rmtSetEOT(BoardConfig::kLedData, LOW);
@@ -74,7 +79,7 @@ void PixelStrip::playEffect(const char* path, uint8_t fallbackMode, uint8_t brig
 }
 
 void PixelStrip::showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness,
-                           uint32_t startAtMs) {
+                           ClockEffect effect, uint32_t startAtMs) {
   if (!queue_) return;
   Command command{};
   command.type = CommandType::kClock;
@@ -85,6 +90,7 @@ void PixelStrip::showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t
   command.color = color;
   command.hour = static_cast<uint8_t>(std::min<int>(hour, 23));
   command.minute = static_cast<uint8_t>(std::min<int>(minute, 59));
+  command.clockEffect = effect;
   xQueueOverwrite(queue_, &command);
 }
 
@@ -147,6 +153,7 @@ void PixelStrip::taskLoop() {
   uint32_t phase = 0;
   uint32_t nextFrame = millis();
   uint32_t startAt = 0;
+  bool frameDirty = true;
   for (;;) {
     Command command{};
     if (xQueueReceive(queue_, &command, 0) == pdTRUE) {
@@ -169,6 +176,7 @@ void PixelStrip::taskLoop() {
           clockHour_ = command.hour;
           clockMinute_ = command.minute;
           clockColor_ = command.color;
+          clockEffect_ = command.clockEffect;
         }
         if (oceanActive_) {
           oceanColor_ = command.color;
@@ -188,24 +196,33 @@ void PixelStrip::taskLoop() {
         }
         startAt = command.startAtMs;
         phase = 0;
+        frameDirty = true;
         nextFrame = std::max(millis(), startAt);
       }
     }
     const uint32_t now = millis();
+    const bool animatedClock = clockActive_ && clockEffect_ != ClockEffect::kSteady;
+    const bool renderContinuously = animatedClock || oceanActive_ || effectActive_ ||
+                                    (!clockActive_ && !topologyTestActive_ && !oceanActive_ &&
+                                     !effectActive_ && mode_ != 0);
     if (static_cast<int32_t>(now - nextFrame) >= 0 && static_cast<int32_t>(now - startAt) >= 0) {
-      if (topologyTestActive_) {
-        renderTopologyTest();
-      } else if (clockActive_) {
-        renderClock(phase++);
-      } else if (oceanActive_) {
-        renderOcean(phase++);
-      } else if (effectActive_) {
-        renderEffect(phase++);
-        if (!effectLoop_ && phase >= effectTicks_) effectActive_ = false;
-      } else {
-        render(mode_, phase++);
+      if (frameDirty || renderContinuously) {
+        if (topologyTestActive_) {
+          renderTopologyTest();
+        } else if (clockActive_) {
+          renderClock(phase);
+        } else if (oceanActive_) {
+          renderOcean(phase);
+        } else if (effectActive_) {
+          renderEffect(phase);
+          if (!effectLoop_ && phase >= effectTicks_) effectActive_ = false;
+        } else {
+          render(mode_, phase);
+        }
+        transmit();
+        frameDirty = false;
+        if (renderContinuously) ++phase;
       }
-      transmit();
       nextFrame = now + kFramePeriodMs;
     }
     vTaskDelay(pdMS_TO_TICKS(4));
@@ -240,19 +257,39 @@ void PixelStrip::renderClock(uint32_t phase) {
   constexpr int kStartX = (BoardConfig::kLedWidth - kClockWidth) / 2;
   constexpr int kStartY = 1;
   constexpr uint8_t kDigitX[4] = {0, 6, 14, 20};
-  for (uint8_t digit = 0; digit < 4; ++digit) {
-    const int x = kStartX + kDigitX[digit];
-    for (uint8_t row = 0; row < 7; ++row) {
-      for (uint8_t column = 0; column < 5; ++column) {
-        if (kDigits[values[digit]][row] & (1U << (4 - column))) {
-          setPixel(kStartY + row, x + column, red, green, blue);
+  const bool visible = clockEffect_ != ClockEffect::kBlink || (phase / 12) % 2 == 0;
+  if (visible) {
+    for (uint8_t digit = 0; digit < 4; ++digit) {
+      const int x = kStartX + kDigitX[digit];
+      for (uint8_t row = 0; row < 7; ++row) {
+        for (uint8_t column = 0; column < 5; ++column) {
+          if (kDigits[values[digit]][row] & (1U << (4 - column))) {
+            setPixel(kStartY + row, x + column, red, green, blue);
+          }
         }
       }
     }
-  }
-  if ((phase / 12) % 2 == 0) {
     setPixel(kStartY + 2, kStartX + 12, red, green, blue);
     setPixel(kStartY + 5, kStartX + 12, red, green, blue);
+  }
+  if (clockEffect_ == ClockEffect::kOrbit) {
+    const int perimeter = 2 * BoardConfig::kLedWidth + 2 * (BoardConfig::kLedHeight - 2);
+    int position = phase % perimeter;
+    int row = 0;
+    int column = 0;
+    if (position < BoardConfig::kLedWidth) {
+      column = position;
+    } else if ((position -= BoardConfig::kLedWidth) < BoardConfig::kLedHeight - 1) {
+      column = BoardConfig::kLedWidth - 1;
+      row = position;
+    } else if ((position -= BoardConfig::kLedHeight - 1) < BoardConfig::kLedWidth) {
+      column = BoardConfig::kLedWidth - 1 - position;
+      row = BoardConfig::kLedHeight - 1;
+    } else {
+      position -= BoardConfig::kLedWidth;
+      row = BoardConfig::kLedHeight - 1 - position;
+    }
+    setPixel(row, column, red, green, blue);
   }
 }
 
@@ -294,14 +331,14 @@ void PixelStrip::renderOcean(uint32_t phase) {
 
 void PixelStrip::renderTopologyTest() {
   clear();
-  // Colors identify serial positions, not screen coordinates:
-  // They expose the first physical corner and the direction of the first two
-  // and final rows even when the logical transform is currently wrong.
+  // Colors identify serial positions, not screen coordinates. They expose
+  // the two ends of the first columns and the final left column, even if a
+  // logical orientation setting is wrong.
   setPixelPhysical(0, 255, 0, 0);
-  setPixelPhysical(BoardConfig::kLedWidth - 1, 0, 255, 0);
-  setPixelPhysical(BoardConfig::kLedWidth, 0, 0, 255);
-  setPixelPhysical(2 * BoardConfig::kLedWidth - 1, 255, 255, 0);
-  setPixelPhysical((BoardConfig::kLedHeight - 1) * BoardConfig::kLedWidth, 0, 255, 255);
+  setPixelPhysical(BoardConfig::kLedHeight - 1, 0, 255, 0);
+  setPixelPhysical(BoardConfig::kLedHeight, 0, 0, 255);
+  setPixelPhysical(2 * BoardConfig::kLedHeight - 1, 255, 255, 0);
+  setPixelPhysical((BoardConfig::kLedWidth - 1) * BoardConfig::kLedHeight, 0, 255, 255);
   setPixelPhysical(BoardConfig::kLedCount - 1, 255, 0, 255);
 }
 
@@ -520,11 +557,22 @@ void PixelStrip::setPixel(int row, int column, uint8_t red, uint8_t green, uint8
   if (row < 0 || row >= BoardConfig::kLedHeight || column < 0 || column >= BoardConfig::kLedWidth) {
     return;
   }
-  // The panel is row-serpentine.  Its front-facing origin is calibrated with
-  // renderTopologyTest(); mirror controls remain the only board-specific
-  // transform instead of leaking orientation assumptions into renderers.
+  // The panel is column-serpentine: DIN is the top-right pixel, runs down the
+  // first nine-pixel column, then up the next column toward the left. Keep
+  // that physical knowledge here so clocks, ocean and authored LED frames all
+  // share the same front-facing coordinate system.
   const int logicalRow = BoardConfig::kLedMirrorY ? BoardConfig::kLedHeight - 1 - row : row;
   const int logicalColumn = BoardConfig::kLedMirrorX ? BoardConfig::kLedWidth - 1 - column : column;
+  if constexpr (BoardConfig::kLedCascadeVertical) {
+    const int cascadeColumn = BoardConfig::kLedDataStartsAtRight
+                                  ? BoardConfig::kLedWidth - 1 - logicalColumn
+                                  : logicalColumn;
+    const bool reverseColumn = static_cast<bool>(cascadeColumn & 1) !=
+                               BoardConfig::kLedFirstColumnTopDown;
+    const int cascadeRow = reverseColumn ? BoardConfig::kLedHeight - 1 - logicalRow : logicalRow;
+    setPixelPhysical(cascadeColumn * BoardConfig::kLedHeight + cascadeRow, red, green, blue);
+    return;
+  }
   const int physicalColumn = (logicalRow & 1) ? BoardConfig::kLedWidth - 1 - logicalColumn : logicalColumn;
   setPixelPhysical(logicalRow * BoardConfig::kLedWidth + physicalColumn, red, green, blue);
 }

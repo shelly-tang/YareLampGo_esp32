@@ -68,6 +68,14 @@ uint32_t parseColor(String value) {
   return end && *end == '\0' ? result : 0xFFFFFF;
 }
 
+ClockEffect parseClockEffect(String value) {
+  value.trim();
+  value.toLowerCase();
+  if (value == "blink") return ClockEffect::kBlink;
+  if (value == "orbit") return ClockEffect::kOrbit;
+  return ClockEffect::kSteady;
+}
+
 uint8_t percent(JsonVariantConst value, uint8_t fallback) {
   if (value.isNull()) return fallback;
   return static_cast<uint8_t>(std::max(0, std::min(100, value.as<int>())));
@@ -308,7 +316,7 @@ void DeviceHttp::handleStatus() {
   response["led_ready"] = expressions_.ledReady();
   response["led_mode"] = expressions_.currentMode();
   response["led_brightness"] = expressions_.currentBrightness();
-  response["led_driver"] = "p4-rmt-direct";
+  response["led_driver"] = "p4-rmt-buffered";
   response["led_pixel_pin"] = BoardConfig::kLedData;
   response["led_pixel_count"] = BoardConfig::kLedCount;
   response["led_width"] = BoardConfig::kLedWidth;
@@ -517,7 +525,8 @@ void DeviceHttp::handleClock() {
   } else {
     expressions_.showClock(body["hour"] | 0, body["minute"] | 0,
                            parseColor(String(body["color"] | "#ffffff")),
-                           body["brightness"] | BoardConfig::kLedSafeBrightness);
+                           body["brightness"] | BoardConfig::kLedSafeBrightness,
+                           parseClockEffect(String(body["effect"] | "steady")));
   }
   JsonDocument response;
   response["ok"] = true;

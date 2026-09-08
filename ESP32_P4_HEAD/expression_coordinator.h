@@ -16,7 +16,8 @@ class ExpressionCoordinator {
   bool play(const String& expression, int mode, const String& eyeClipId,
             const String& ledEffectId, uint8_t brightness, bool loop);
   void setBrightness(uint8_t brightness);
-  void showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness);
+  void showClock(uint8_t hour, uint8_t minute, uint32_t color, uint8_t brightness,
+                 ClockEffect effect);
   void startOcean(uint32_t color, uint8_t brightness, uint8_t fillPercent,
                   uint16_t sensitivityPercent, uint8_t edgeHighlightPercent,
                   uint16_t tiltPercent, uint16_t impactPercent, uint16_t dampingPercent);

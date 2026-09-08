@@ -7,7 +7,7 @@
 
 namespace BoardConfig {
 
-constexpr char kFirmwareVersion[] = "p4-head-0.2.0";
+constexpr char kFirmwareVersion[] = "p4-head-0.2.4";
 constexpr char kMotionProtocol[] = "lampgo-motion-v1";
 
 constexpr int kServoTx = 31;
@@ -19,6 +19,12 @@ constexpr int kLedData = 53;
 constexpr uint16_t kLedWidth = 54;
 constexpr uint16_t kLedHeight = 9;
 constexpr uint16_t kLedCount = kLedWidth * kLedHeight;
+// The 9x54 panel is wired as 54 vertical nine-pixel columns. DIN enters at
+// the top-right and the next column runs upward, so logical front-facing
+// pixels need a right-to-left column-serpentine transform before transmission.
+constexpr bool kLedCascadeVertical = true;
+constexpr bool kLedDataStartsAtRight = true;
+constexpr bool kLedFirstColumnTopDown = true;
 // Logical pixel (0, 0) is the top-left corner when the lamp is viewed from
 // the front.  The diagnostic endpoint renders fixed *physical* indices so
 // this transform can be confirmed before changing either flag.

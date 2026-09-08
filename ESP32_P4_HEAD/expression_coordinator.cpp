@@ -60,8 +60,8 @@ void ExpressionCoordinator::setBrightness(uint8_t brightness) {
 }
 
 void ExpressionCoordinator::showClock(uint8_t hour, uint8_t minute, uint32_t color,
-                                      uint8_t brightness) {
-  pixels_.showClock(hour, minute, color, brightness, millis() + 20);
+                                      uint8_t brightness, ClockEffect effect) {
+  pixels_.showClock(hour, minute, color, brightness, effect, millis() + 20);
   currentBrightness_ = brightness;
 }
 
