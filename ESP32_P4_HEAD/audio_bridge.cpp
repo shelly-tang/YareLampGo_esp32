@@ -4,6 +4,7 @@
 #include "audio_bridge.h"
 
 #include <ESP_I2S.h>
+#include <ArduinoJson.h>
 #include <esp_afe_config.h>
 #include <esp_afe_sr_iface.h>
 #include <esp_afe_sr_models.h>
@@ -87,19 +88,47 @@ int gAfeFeedSamples = 0;
 int gAfeChannels = 0;
 size_t gAfeFill = 0;
 
-bool extractQuery(httpd_req_t* request, const char* key, char* output, size_t length) {
-  char query[320]{};
-  output[0] = 0;
-  return httpd_req_get_url_query_str(request, query, sizeof(query)) == ESP_OK &&
-         httpd_query_key_value(query, key, output, length) == ESP_OK && output[0] != 0;
-}
+enum class WsAuthResult : uint8_t { kPending, kAuthorized, kRejected, kClosed };
 
-bool authorize(httpd_req_t* request) {
-  char owner[96]{};
-  char secret[160]{};
-  return gPairing && extractQuery(request, "owner", owner, sizeof(owner)) &&
-         extractQuery(request, "token", secret, sizeof(secret)) &&
-         gPairing->authorize(owner, secret);
+WsAuthResult authenticateWsFrame(httpd_req_t* request, const char* purpose) {
+  httpd_ws_frame_t frame{};
+  if (httpd_ws_recv_frame(request, &frame, 0) != ESP_OK) return WsAuthResult::kRejected;
+  if (frame.type == HTTPD_WS_TYPE_CLOSE) return WsAuthResult::kClosed;
+  if (frame.type != HTTPD_WS_TYPE_TEXT || frame.len == 0 || frame.len >= 384) {
+    return WsAuthResult::kRejected;
+  }
+  char payload[384]{};
+  frame.payload = reinterpret_cast<uint8_t*>(payload);
+  if (httpd_ws_recv_frame(request, &frame, frame.len) != ESP_OK) return WsAuthResult::kRejected;
+  JsonDocument message;
+  if (deserializeJson(message, payload, frame.len) || !message.is<JsonObject>()) {
+    return WsAuthResult::kRejected;
+  }
+  JsonObjectConst body = message.as<JsonObjectConst>();
+  if (String(body["type"] | "") == "auth_init") {
+    if (String(body["purpose"] | "") != purpose || !gPairing) return WsAuthResult::kRejected;
+    const String nonce = gPairing->issueChallenge(purpose);
+    if (nonce.isEmpty()) return WsAuthResult::kRejected;
+    JsonDocument challenge;
+    challenge["type"] = "challenge";
+    challenge["purpose"] = purpose;
+    challenge["nonce"] = nonce;
+    String encoded;
+    serializeJson(challenge, encoded);
+    httpd_ws_frame_t response{};
+    response.type = HTTPD_WS_TYPE_TEXT;
+    response.payload = reinterpret_cast<uint8_t*>(const_cast<char*>(encoded.c_str()));
+    response.len = encoded.length();
+    return httpd_ws_send_frame(request, &response) == ESP_OK ? WsAuthResult::kPending
+                                                              : WsAuthResult::kRejected;
+  }
+  if (String(body["type"] | "") != "auth" || String(body["auth_purpose"] | "") != purpose ||
+      !gPairing ||
+      !gPairing->authorizeProof(body["owner_id"] | "", purpose, body["auth_nonce"] | "",
+                                 body["auth_proof"] | "")) {
+    return WsAuthResult::kRejected;
+  }
+  return WsAuthResult::kAuthorized;
 }
 
 void removeAudioClient(int fd) {
@@ -409,38 +438,16 @@ void enqueueSpeaker(const uint8_t* data, size_t length) {
 esp_err_t audioHandler(httpd_req_t* request) {
   const int fd = httpd_req_to_sockfd(request);
   if (request->method == HTTP_GET) {
-    if (authorize(request) && addAudioClient(fd, gPairing->revision())) return ESP_OK;
-    gAudioAuthFailures = gAudioAuthFailures + 1;
-    return ESP_FAIL;
+    return gPairing && gPairing->isPaired() ? ESP_OK : ESP_FAIL;
   }
-  httpd_ws_frame_t frame{};
-  if (httpd_ws_recv_frame(request, &frame, 0) != ESP_OK) return ESP_FAIL;
-  if (frame.type == HTTPD_WS_TYPE_CLOSE) {
+  if (isAudioClient(fd)) return ESP_OK;
+  const WsAuthResult auth = authenticateWsFrame(request, "ws:audio");
+  if (auth == WsAuthResult::kClosed) {
     removeAudioClient(fd);
     return ESP_OK;
   }
-  if (frame.len == 0 || frame.len >= 288) {
-    gAudioAuthFailures = gAudioAuthFailures + 1;
-    return ESP_FAIL;
-  }
-  char credentials[288]{};
-  frame.payload = reinterpret_cast<uint8_t*>(credentials);
-  if (httpd_ws_recv_frame(request, &frame, frame.len) != ESP_OK) return ESP_FAIL;
-  if (isAudioClient(fd)) return ESP_OK;
-  if (frame.type != HTTPD_WS_TYPE_TEXT) {
-    gAudioAuthFailures = gAudioAuthFailures + 1;
-    return ESP_FAIL;
-  }
-  const char* tokenPrefix = "&token=";
-  char* token = strstr(credentials, tokenPrefix);
-  if (strncmp(credentials, "owner=", 6) != 0 || !token) {
-    gAudioAuthFailures = gAudioAuthFailures + 1;
-    return ESP_FAIL;
-  }
-  *token = 0;
-  token += strlen(tokenPrefix);
-  if (!gPairing || !gPairing->authorize(credentials + 6, token) ||
-      !addAudioClient(fd, gPairing->revision())) {
+  if (auth == WsAuthResult::kPending) return ESP_OK;
+  if (auth != WsAuthResult::kAuthorized || !addAudioClient(fd, gPairing->revision())) {
     gAudioAuthFailures = gAudioAuthFailures + 1;
     return ESP_FAIL;
   }
@@ -448,21 +455,26 @@ esp_err_t audioHandler(httpd_req_t* request) {
 }
 
 esp_err_t eventHandler(httpd_req_t* request) {
-  if (request->method == HTTP_GET && !authorize(request)) return ESP_FAIL;
-  httpd_ws_frame_t frame{};
-  if (request->method != HTTP_GET) httpd_ws_recv_frame(request, &frame, 0);
-  return ESP_OK;
+  if (request->method == HTTP_GET) return gPairing && gPairing->isPaired() ? ESP_OK : ESP_FAIL;
+  const WsAuthResult auth = authenticateWsFrame(request, "ws:events");
+  return auth == WsAuthResult::kRejected ? ESP_FAIL : ESP_OK;
 }
 
 esp_err_t speakerHandler(httpd_req_t* request) {
   const int fd = httpd_req_to_sockfd(request);
   if (request->method == HTTP_GET) {
-    if (!authorize(request)) return ESP_FAIL;
-    gSpeakerClient = fd;
-    gSpeakerRevision = gPairing->revision();
-    return ESP_OK;
+    return gPairing && gPairing->isPaired() ? ESP_OK : ESP_FAIL;
   }
-  if (!gPairing || gSpeakerRevision != gPairing->revision()) {
+  if (!gPairing) return ESP_FAIL;
+  if (gSpeakerClient != fd) {
+    const WsAuthResult auth = authenticateWsFrame(request, "ws:speaker");
+    if (auth == WsAuthResult::kAuthorized) {
+      gSpeakerClient = fd;
+      gSpeakerRevision = gPairing->revision();
+    }
+    return auth == WsAuthResult::kRejected ? ESP_FAIL : ESP_OK;
+  }
+  if (gSpeakerRevision != gPairing->revision()) {
     if (gSpeakerClient == fd) gSpeakerClient = -1;
     httpd_sess_trigger_close(gServer, fd);
     return ESP_FAIL;

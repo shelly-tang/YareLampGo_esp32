@@ -42,6 +42,7 @@ void MotionServer::onEvent(uint8_t client, WStype_t type, uint8_t* payload, size
       authenticated_[client] = false;
       pairingRevision_[client] = 0;
       Serial.printf("[MOTION] client=%u connected path=%.*s\n", client, static_cast<int>(length), payload);
+      sendChallenge(client);
       break;
     case WStype_DISCONNECTED:
       authenticated_[client] = false;
@@ -93,12 +94,14 @@ void MotionServer::handleHello(uint8_t client, JsonObjectConst message) {
   const char* requestId = message["request_id"] | "";
   const String protocol = message["protocol"] | "";
   const String ownerId = message["owner_id"] | "";
-  const String secret = message["pairing_secret"] | "";
+  const String nonce = message["auth_nonce"] | "";
+  const String proof = message["auth_proof"] | "";
   if (protocol != BoardConfig::kMotionProtocol) {
     sendError(client, requestId, "unsupported motion protocol");
     return;
   }
-  if (!pairing_.authorize(ownerId, secret)) {
+  if (String(message["auth_purpose"] | "") != "ws:motion" ||
+      !pairing_.authorizeProof(ownerId, "ws:motion", nonce, proof)) {
     sendError(client, requestId, pairing_.isPaired() ? "pairing mismatch" : "device is not paired");
     return;
   }
@@ -112,6 +115,21 @@ void MotionServer::handleHello(uint8_t client, JsonObjectConst message) {
   response["protocol"] = BoardConfig::kMotionProtocol;
   response["firmware"] = BoardConfig::kFirmwareVersion;
   addSnapshot(response.as<JsonObject>(), servos_.snapshot());
+  String encoded;
+  serializeJson(response, encoded);
+  socket_.sendTXT(client, encoded);
+}
+
+void MotionServer::sendChallenge(uint8_t client) {
+  const String nonce = pairing_.issueChallenge("ws:motion");
+  if (nonce.isEmpty()) {
+    socket_.disconnect(client);
+    return;
+  }
+  JsonDocument response;
+  response["type"] = "challenge";
+  response["purpose"] = "ws:motion";
+  response["nonce"] = nonce;
   String encoded;
   serializeJson(response, encoded);
   socket_.sendTXT(client, encoded);

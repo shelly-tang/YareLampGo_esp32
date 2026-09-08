@@ -82,7 +82,10 @@ state live in NVS and are not part of that format operation.
 - mDNS service: `_lampgo-cam._tcp`
 
 Pairing is shared by HTTP, audio, and motion. Pairing secrets are stored as a
-SHA-256 digest, and asset or motion changes require the paired owner.
+SHA-256 digest. After provisioning, normal P4 HTTP, asset, audio, speaker, and
+motion connections use a short-lived device nonce plus an HMAC proof; the
+reusable pairing secret is never sent over those LAN transports. This requires
+the matching P4 backend branch and firmware image to be upgraded together.
 
 The existing LampGo setup wizard remains the provisioning entry point. While
 the computer is joined to the setup AP it uses `GET /status`, `GET /scan`, and

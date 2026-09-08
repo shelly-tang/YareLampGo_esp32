@@ -23,6 +23,7 @@ class MotionServer {
   void handleProfile(uint8_t client, JsonObjectConst message);
   void handleFrame(uint8_t client, JsonObjectConst message);
   void handleControl(uint8_t client, JsonObjectConst message);
+  void sendChallenge(uint8_t client);
   void sendError(uint8_t client, const char* requestId, const char* error);
   void sendEvent(const ServoEvent& event);
   void sendTelemetry();

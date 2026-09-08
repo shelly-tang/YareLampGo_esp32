@@ -23,7 +23,9 @@ constexpr size_t kMaxEyeBytes = 512 * 1024;
 constexpr size_t kMaxLedBytes = 8 * 1024;
 constexpr char kContentTypeHeader[] = "Content-Type";
 constexpr char kOwnerHeader[] = "X-Lampgo-Owner";
-constexpr char kTokenHeader[] = "X-Lampgo-Token";
+constexpr char kAuthPurposeHeader[] = "X-Lampgo-Auth-Purpose";
+constexpr char kAuthNonceHeader[] = "X-Lampgo-Auth-Nonce";
+constexpr char kAuthProofHeader[] = "X-Lampgo-Auth-Proof";
 constexpr char kClipIdHeader[] = "X-Lampgo-Clip-Id";
 constexpr char kEffectIdHeader[] = "X-Lampgo-Effect-Id";
 constexpr char kUploadPhaseHeader[] = "X-Lampgo-Upload-Phase";
@@ -74,9 +76,10 @@ DeviceHttp::DeviceHttp(PairingStore& pairing, ServoExecutor& servos,
 void DeviceHttp::begin() {
   // Raw body callbacks run before WebServer parses query arguments.  Retain
   // the headers that identify the paired owner and target asset.
-  const char* headers[] = {kContentTypeHeader, kOwnerHeader, kTokenHeader,
-                           kClipIdHeader, kEffectIdHeader, kUploadPhaseHeader};
-  server_.collectHeaders(headers, 6);
+  const char* headers[] = {kContentTypeHeader, kOwnerHeader, kAuthPurposeHeader,
+                           kAuthNonceHeader, kAuthProofHeader, kClipIdHeader,
+                           kEffectIdHeader, kUploadPhaseHeader};
+  server_.collectHeaders(headers, 8);
   registerRoutes();
   server_.begin();
   Serial.printf("[HTTP READY] http://%s/\n", hostname_.c_str());
@@ -104,6 +107,7 @@ void DeviceHttp::registerRoutes() {
   server_.on("/config", HTTP_POST, [this]() { handleConfig(); });
   server_.on("/device/config", HTTP_GET, [this]() { handleConfigRead(); });
   server_.on("/device/config", HTTP_POST, [this]() { handleConfig(); });
+  server_.on("/device/auth/challenge", HTTP_GET, [this]() { handleAuthChallenge(); });
   server_.on("/capture", HTTP_GET, [this]() { camera_.sendJpeg(server_); });
   server_.on("/device/pair", HTTP_POST, [this]() { handlePair(); });
   server_.on("/device/unpair", HTTP_POST, [this]() { handleUnpair(); });
@@ -339,6 +343,24 @@ void DeviceHttp::handleConfigRead() {
   sendJson(200, response);
 }
 
+void DeviceHttp::handleAuthChallenge() {
+  const String purpose = server_.arg("purpose");
+  if (!purpose.startsWith("http:POST:/") && !purpose.startsWith("asset:POST:/")) {
+    sendError(400, "invalid authentication purpose");
+    return;
+  }
+  const String nonce = pairing_.issueChallenge(purpose);
+  if (nonce.isEmpty()) {
+    sendError(403, pairing_.isPaired() ? "cannot issue authentication challenge" : "device is not paired");
+    return;
+  }
+  JsonDocument response;
+  response["ok"] = true;
+  response["purpose"] = purpose;
+  response["nonce"] = nonce;
+  sendJson(200, response);
+}
+
 void DeviceHttp::handleConfig() {
   JsonDocument request;
   if (!parseJson(request)) return;
@@ -400,7 +422,7 @@ void DeviceHttp::handleUnpair() {
   JsonDocument request;
   if (!parseJson(request)) return;
   JsonObjectConst body = request.as<JsonObjectConst>();
-  if (!pairing_.unpair(body["owner_id"] | "", body["pairing_secret"] | "")) {
+  if (!authorize(body) || !pairing_.clear()) {
     sendError(403, "pairing mismatch");
     return;
   }
@@ -577,7 +599,7 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
                                                  server_.header(kEffectIdHeader);
     if (phase == "start") {
       if (raw.status == RAW_START) {
-        startUpload(kind, id);
+        startUpload(kind, id, authorizeRequest(String("asset:POST:") + server_.uri() + ":start"));
       } else if (raw.status == RAW_WRITE && raw.currentSize != 0) {
         uploadOk_ = false;
         uploadError_ = "start body must be empty";
@@ -586,7 +608,7 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
       }
     } else if (phase == "chunk") {
       if (raw.status == RAW_START) {
-        if (!authorizeRequest() || !uploadOk_ || kind != uploadKind_ || id != uploadId_ || !uploadFile_) {
+        if (!authorizeRequest(String("asset:POST:") + server_.uri() + ":chunk") || !uploadOk_ || kind != uploadKind_ || id != uploadId_ || !uploadFile_) {
           uploadOk_ = false;
           uploadError_ = "no matching asset upload";
         }
@@ -597,7 +619,7 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
       }
     } else if (phase == "finish") {
       if (raw.status == RAW_START) {
-        if (!authorizeRequest() || !uploadOk_ || kind != uploadKind_ || id != uploadId_ || !uploadFile_) {
+        if (!authorizeRequest(String("asset:POST:") + server_.uri() + ":finish") || !uploadOk_ || kind != uploadKind_ || id != uploadId_ || !uploadFile_) {
           uploadOk_ = false;
           uploadError_ = "no matching asset upload";
         }
@@ -619,7 +641,7 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
     if (raw.status == RAW_START) {
       const String id = kind == UploadKind::kEye ? server_.header(kClipIdHeader) :
                                                    server_.header(kEffectIdHeader);
-      startUpload(kind, id);
+      startUpload(kind, id, authorizeRequest(String("asset:POST:") + server_.uri() + ":single"));
     } else if (raw.status == RAW_WRITE) {
       appendUpload(kind, raw.buf, raw.currentSize);
     } else if (raw.status == RAW_END || raw.status == RAW_ABORTED) {
@@ -630,7 +652,8 @@ void DeviceHttp::handleUploadData(UploadKind kind) {
 
   HTTPUpload& upload = server_.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    startUpload(kind, server_.arg(kind == UploadKind::kEye ? "clip_id" : "effect_id"));
+    startUpload(kind, server_.arg(kind == UploadKind::kEye ? "clip_id" : "effect_id"),
+                authorizeRequest(String("asset:POST:") + server_.uri() + ":single"));
   } else if (upload.status == UPLOAD_FILE_WRITE && uploadOk_) {
     appendUpload(kind, upload.buf, upload.currentSize);
   } else if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) {
@@ -691,13 +714,13 @@ void DeviceHttp::finishUploadRequest(UploadKind kind) {
   sendError(400, "invalid upload phase");
 }
 
-void DeviceHttp::startUpload(UploadKind kind, const String& assetId) {
+void DeviceHttp::startUpload(UploadKind kind, const String& assetId, bool authorized) {
   if (uploadFile_) uploadFile_.close();
   uploadKind_ = kind;
   uploadId_ = assetId;
   uploadTempPath_ = kind == UploadKind::kEye ? "/upload_eye.tmp" : "/upload_led.tmp";
   uploadBytes_ = 0;
-  uploadOk_ = authorizeRequest() && ExpressionCoordinator::safeAssetId(uploadId_);
+  uploadOk_ = authorized && ExpressionCoordinator::safeAssetId(uploadId_);
   uploadError_ = uploadOk_ ? "" : "unauthorized or invalid asset id";
   if (uploadOk_) {
     LittleFS.remove(uploadTempPath_);
@@ -776,8 +799,6 @@ void DeviceHttp::handleForgetWifi() {
     sendError(403, "pairing mismatch");
     return;
   }
-  const String ownerId = pairing_.ownerId();
-  const String pairingSecret = request["pairing_secret"] | "";
   Preferences preferences;
   if (!preferences.begin("lampgo-net", false)) {
     sendError(500, "cannot open WiFi settings");
@@ -789,7 +810,7 @@ void DeviceHttp::handleForgetWifi() {
     sendError(500, "cannot clear WiFi settings");
     return;
   }
-  if (!pairing_.unpair(ownerId, pairingSecret)) {
+  if (!pairing_.clear()) {
     sendError(500, "cannot clear pairing");
     return;
   }
@@ -831,15 +852,16 @@ bool DeviceHttp::parseJson(JsonDocument& document) {
 }
 
 bool DeviceHttp::authorize(JsonObjectConst body) const {
-  return pairing_.authorize(body["owner_id"] | "", body["pairing_secret"] | "");
+  const String purpose = String("http:POST:") + server_.uri();
+  return String(body["auth_purpose"] | "") == purpose &&
+         pairing_.authorizeProof(body["owner_id"] | "", purpose, body["auth_nonce"] | "",
+                                body["auth_proof"] | "");
 }
 
-bool DeviceHttp::authorizeRequest() const {
-  const String owner = server_.header(kOwnerHeader).isEmpty() ? server_.arg("owner") :
-                                                              server_.header(kOwnerHeader);
-  const String token = server_.header(kTokenHeader).isEmpty() ? server_.arg("token") :
-                                                              server_.header(kTokenHeader);
-  return pairing_.authorize(owner, token);
+bool DeviceHttp::authorizeRequest(const String& purpose) const {
+  return server_.header(kAuthPurposeHeader) == purpose &&
+         pairing_.authorizeProof(server_.header(kOwnerHeader), purpose,
+                                server_.header(kAuthNonceHeader), server_.header(kAuthProofHeader));
 }
 
 bool DeviceHttp::validateStoredAsset(UploadKind kind, const String& path, String& error) const {

@@ -14,7 +14,9 @@ constexpr size_t kMaxLedBytes = 8 * 1024;
 constexpr size_t kMaxChunkBytes = 1024;
 constexpr size_t kMaxHeaderValueBytes = 128;
 constexpr char kOwnerHeader[] = "X-Lampgo-Owner";
-constexpr char kTokenHeader[] = "X-Lampgo-Token";
+constexpr char kAuthPurposeHeader[] = "X-Lampgo-Auth-Purpose";
+constexpr char kAuthNonceHeader[] = "X-Lampgo-Auth-Nonce";
+constexpr char kAuthProofHeader[] = "X-Lampgo-Auth-Proof";
 constexpr char kClipIdHeader[] = "X-Lampgo-Clip-Id";
 constexpr char kEffectIdHeader[] = "X-Lampgo-Effect-Id";
 constexpr char kUploadPhaseHeader[] = "X-Lampgo-Upload-Phase";
@@ -88,14 +90,20 @@ esp_err_t AssetUploadServer::handleLedUpload(httpd_req_t* request) {
 
 esp_err_t AssetUploadServer::handleUpload(httpd_req_t* request, bool eyeAsset) {
   String owner;
-  String token;
+  String authPurpose;
+  String nonce;
+  String proof;
   String assetId;
   String phase;
   const UploadKind kind = eyeAsset ? UploadKind::kEye : UploadKind::kLed;
   const char* idHeader = eyeAsset ? kClipIdHeader : kEffectIdHeader;
-  if (!readHeader(request, kOwnerHeader, owner) || !readHeader(request, kTokenHeader, token) ||
-      !readHeader(request, idHeader, assetId) || !readHeader(request, kUploadPhaseHeader, phase) ||
-      !pairing_.authorize(owner, token)) {
+  if (!readHeader(request, kOwnerHeader, owner) || !readHeader(request, kAuthPurposeHeader, authPurpose) ||
+      !readHeader(request, kAuthNonceHeader, nonce) || !readHeader(request, kAuthProofHeader, proof) ||
+      !readHeader(request, idHeader, assetId) || !readHeader(request, kUploadPhaseHeader, phase)) {
+    return sendError(request, "403 Forbidden", "pairing mismatch");
+  }
+  const String expectedPurpose = String("asset:POST:") + request->uri + ":" + phase;
+  if (authPurpose != expectedPurpose || !pairing_.authorizeProof(owner, expectedPurpose, nonce, proof)) {
     return sendError(request, "403 Forbidden", "pairing mismatch");
   }
   if (!ExpressionCoordinator::safeAssetId(assetId)) {

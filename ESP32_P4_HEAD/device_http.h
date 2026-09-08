@@ -31,6 +31,7 @@ class DeviceHttp {
   void handleScan();
   void handleConnect();
   void handleConfigRead();
+  void handleAuthChallenge();
   void handleConfig();
   void handlePair();
   void handleUnpair();
@@ -44,7 +45,7 @@ class DeviceHttp {
   void handleAssetDelete(UploadKind kind);
   void handleUploadData(UploadKind kind);
   void finishUploadRequest(UploadKind kind);
-  void startUpload(UploadKind kind, const String& assetId);
+  void startUpload(UploadKind kind, const String& assetId, bool authorized);
   void appendUpload(UploadKind kind, const uint8_t* data, size_t size);
   void endUpload(UploadKind kind, bool aborted);
   void finishUpload(UploadKind kind);
@@ -54,7 +55,7 @@ class DeviceHttp {
   void handleServoStatus();
   bool parseJson(JsonDocument& document);
   bool authorize(JsonObjectConst body) const;
-  bool authorizeRequest() const;
+  bool authorizeRequest(const String& purpose) const;
   bool validateStoredAsset(UploadKind kind, const String& path, String& error) const;
   String assetPath(UploadKind kind, const String& id) const;
   void sendJson(int status, JsonDocument& document);
